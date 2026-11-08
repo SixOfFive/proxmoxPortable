@@ -2,7 +2,9 @@
 
 All notable changes to proxmox-portable. Newest first.
 
-## Unreleased
+## 1.0.0 - 2026-11-08 - released as tag `v1.0.0`
+
+The release is the initial commit (below) plus these changes from the same day:
 
 ### Added
 - MIT license (`LICENSE`), linked from the README.
@@ -26,9 +28,9 @@ host, an AMD Ryzen 5 3500U laptop on Wi-Fi only:
 - cold move from LVM-thin with USB by vendor:product (attached on the host) and by port (dropped)
 - cold return to LVM-thin, sha256 identical, USB config unchanged
 
-## 1.0.0 - 2026-11-08
+## 1.0.0 initial commit - 2026-11-08
 
-First public release. proxmox-portable is a single-script rewrite of an earlier private,
+First public commit. proxmox-portable is a single-script rewrite of an earlier private,
 multi-machine tool, which had a central web server driving agents on several laptops over SSH.
 Now everything runs on the portable machine itself, and it manages only its own guests.
 

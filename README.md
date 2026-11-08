@@ -44,7 +44,8 @@ LAN while guests run on it.
 13. [When something goes wrong](#when-something-goes-wrong)
 14. [Updating](#updating)
 15. [Uninstall](#uninstall)
-16. [License](#license)
+16. [Releases](#releases)
+17. [License](#license)
 
 ---
 
@@ -674,6 +675,22 @@ sed -i '/ proxmox-portable@<host>$/d' /etc/pve/priv/authorized_keys
 pveum user token remove root@pam portable
 rm -rf /var/tmp/proxmox-portable                          # on each node that received syncs
 ```
+
+---
+
+## Releases
+
+Each release is a git tag. A tag's page has the source as `.zip` / `.tar.gz`. `main` may hold
+newer, not yet released work.
+
+| Version | Date | What | Get it |
+|---|---|---|---|
+| **v1.0.0** | 2026-11-08 | First public release. Live/cold VM moves, container moves, sync, return; tested as described in [What has been tested](#what-has-been-tested) | [tag v1.0.0](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.0.0) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.0.0/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.0.0.tar.gz) |
+
+**Next: v1.1.0** (in development on `main`). Planned:
+- a VNC console for guests on the portable host
+- qcow2 source volumes
+- returning a guest straight to a different node
 
 ---
 
