@@ -1,0 +1,99 @@
+# proxmox-portable configuration
+#
+# Copy this file to /etc/proxmox-portable/proxmox-portable.conf and edit it:
+#   sudo install -d -m 0700 /etc/proxmox-portable
+#   sudo install -m 0600 proxmox-portable.conf.example /etc/proxmox-portable/proxmox-portable.conf
+#
+# Every value below is an EXAMPLE. Lines starting with # are comments; comments must be on
+# their own line (a # after a value is part of the value). Restart the service after editing:
+#   sudo systemctl restart proxmox-portable
+
+
+[web]
+# Address and port of the web console. 0.0.0.0 = every interface (reachable from the LAN).
+listen = 0.0.0.0
+port = 8006
+
+# The one login for the console.
+username = admin
+# Either a plain password ...
+password = change-me
+# ... or (better) a hash made with `proxmox-portable hash-password`. When password_hash is set,
+# `password` is ignored. Example of the format:
+# password_hash = pbkdf2_sha256$310000$0123456789abcdef0123456789abcdef$<64 hex characters>
+
+# HTTPS with a self-signed certificate made on first start (like Proxmox's own 8006).
+# Set your own cert/key paths to use a real certificate.
+tls = yes
+# tls_cert = /etc/proxmox-portable/tls.crt
+# tls_key = /etc/proxmox-portable/tls.key
+
+# How long a login lasts, in hours.
+session_hours = 12
+
+# Optional: only these networks may open the console (comma separated CIDRs).
+# Empty = anyone who can reach the port. Localhost is always allowed.
+# allowed_networks = 192.168.1.0/24, 10.8.0.0/24
+allowed_networks =
+
+
+[proxmox]
+# Proxmox VE nodes to talk to (IPs or names). The first one that answers is used.
+hosts = 192.168.1.11, 192.168.1.12, 192.168.1.13
+
+# API token for the console views (Datacenter, nodes, graphs, tasks): user@realm!tokenid=secret
+# Create it in Proxmox: Datacenter > Permissions > API Tokens (see README).
+# Leave empty to read everything with `pvesh` over SSH instead (slower, no token needed).
+token = root@pam!portable=00000000-0000-0000-0000-000000000000
+
+# Check the cluster's HTTPS certificate. Proxmox uses a self-signed one by default: keep "no"
+# unless you installed a trusted certificate on the nodes.
+verify_tls = no
+
+# SSH key this host uses to log in to the nodes as root (made by `proxmox-portable setup`).
+# Its .pub must be in /etc/pve/priv/authorized_keys on the cluster (see README).
+ssh_key = /etc/proxmox-portable/id_pve
+ssh_known_hosts = /etc/proxmox-portable/pve_known_hosts
+
+# Proxmox bridges that are "the LAN". Guest NICs on these bridges can keep their IP here
+# (LAN mode); NICs on other bridges go to this host's NAT bridge.
+lan_bridges = vmbr0
+
+
+[host]
+# Name of this portable host. Parked guests in the cluster get the tag <tag_prefix><name>.
+# Default: the hostname. Use a-z, 0-9 and -.
+# name = mylaptop
+
+# Prefix of that tag. Several portable hosts can share one cluster; each tags with its own name.
+tag_prefix = portable-
+
+
+[network]
+# The LAN that LAN-mode guests live on. gateway empty = take it from this host's default route.
+gateway = 192.168.1.1
+prefix = 24
+# DNS servers handed to LAN-mode guests (empty = the gateway).
+dns = 192.168.1.1
+# Interface that faces that LAN (empty = the interface of the default route). Wi-Fi works.
+lan_iface =
+
+# Bridges this script creates on this host. Change them only if the names clash.
+bridge = ppbr0
+nat_bridge = ppnat0
+# Address of this host on the NAT bridge, and the NAT network (DHCP hands out the upper half).
+nat_network = 10.77.0.1/24
+
+
+[paths]
+# Where moved guests' disks, job logs and graphs live. Needs room for the guests' disks.
+data_dir = /var/lib/proxmox-portable
+# Proxmox's QEMU/swtpm/OVMF bundle (filled by `proxmox-portable fetch-qemu`).
+qemu_bundle = /opt/proxmox-portable/pve-qemu
+
+
+[defaults]
+# Default timeout (seconds) for shutting a guest down here before a cold return.
+shutdown_timeout = 180
+# Default sync interval for new moves: 15min, 30min, hourly, 2h, 6h, daily or off.
+sync_interval = hourly

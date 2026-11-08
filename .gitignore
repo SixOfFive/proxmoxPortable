@@ -1,0 +1,48 @@
+# --- never publish local/real configuration or secrets ---
+# the real config (credentials, API token, addresses); only the .example is tracked
+*.conf
+!proxmox-portable.conf.example
+*.local
+*.local.*
+local/
+secrets/
+*.secret
+.env
+.env.*
+# keys, certificates, known_hosts, tokens
+id_*
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*known_hosts*
+*token*
+*credential*
+*password*
+# runtime data a test run may leave behind
+dnsmasq-hosts
+*.leases
+*.log
+*.json.tmp*
+vms/
+jobs/
+rrd/
+
+# --- assistant / editor / tooling files ---
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.claude*
+*.claude
+.mcp.json
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# --- python ---
+__pycache__/
+*.pyc
