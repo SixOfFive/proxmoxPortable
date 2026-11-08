@@ -1345,6 +1345,13 @@ def volume_info(ip, volid):
             used = int(pve(ip, "zfs get -Hp -o value logicalreferenced %s" % shlex.quote(path[10:])).strip())
         except Exception:
             pass
+    elif path.startswith("/dev/"):
+        try:   # LVM-thin: only the allocated part needs room here (thick LVM reports no data_percent)
+            pct = pve(ip, "lvs --noheadings -o data_percent %s 2>/dev/null" % shlex.quote(path)).strip()
+            if pct:
+                used = int(size * float(pct.replace(",", ".")) / 100)
+        except Exception:
+            pass
     return path, fmt, size, used
 
 

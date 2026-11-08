@@ -9,7 +9,8 @@ QEMU** and the exact command line Proxmox builds for them, and handles every mov
 directions. The machine never joins the cluster, so it can't affect quorum, and it can leave the
 LAN while guests run on it.
 
-- **VMs, live:** no reboot, about 0.02-0.1 s pause, both directions. Disks are pre-seeded while
+- **VMs, live:** no reboot, a pause of about 0.02-0.3 s, both directions, over Wi-Fi too, and between
+  Intel and AMD CPUs. Disks are pre-seeded while
   the VM runs, then only the blocks written since are mirrored, then RAM is migrated.
 - **VMs, cold:** shut down, copy (sha256-verified), boot on the portable host.
 - **Containers:** restart mode (rsync while it runs, short stop, final delta), 10-30 s downtime.
@@ -35,13 +36,15 @@ LAN while guests run on it.
 5. [Prepare the Proxmox cluster](#prepare-the-proxmox-cluster)
 6. [Configuration reference](#configuration-reference)
 7. [Using it](#using-it)
-8. [Networking](#networking)
-9. [Security](#security)
-10. [Limits](#limits)
-11. [Files and logs](#files-and-logs)
-12. [When something goes wrong](#when-something-goes-wrong)
-13. [Updating](#updating)
-14. [Uninstall](#uninstall)
+8. [Use case: empty a node for maintenance or an upgrade](#use-case-empty-a-node-for-maintenance-or-an-upgrade)
+9. [Networking](#networking)
+10. [Security](#security)
+11. [Limits](#limits)
+12. [Files and logs](#files-and-logs)
+13. [When something goes wrong](#when-something-goes-wrong)
+14. [Updating](#updating)
+15. [Uninstall](#uninstall)
+16. [License](#license)
 
 ---
 
@@ -148,23 +151,25 @@ them as packages.
 
 ## What has been tested
 
-proxmox-portable **1.0.0**, 2026-11-08, against a 10-node cluster, with throwaway guests created
-for the test and destroyed afterwards. Each guest wrote checksummed files inside itself before
-and during the moves, and they were re-verified after every step.
+proxmox-portable **1.0.0**, 2026-11-08, against a 10-node cluster, from **two portable hosts**: an
+Intel laptop on wired Ethernet and an AMD laptop on Wi-Fi. Throwaway guests were created for the
+tests and destroyed afterwards. Each guest wrote checksummed files inside itself before and
+during the moves, and they were re-verified after every step.
 
 **Software versions**
 
 | Component | Version |
 |---|---|
 | Portable host OS | Debian GNU/Linux 13.7 (trixie), kernel 6.12.115+deb13.1-amd64 |
-| Portable host CPU | Intel Core i7-12700H (laptop), wired Ethernet |
+| Portable host A | Intel Core i7-12700H laptop, wired Ethernet (USB adapter) |
+| Portable host B | AMD Ryzen 5 3500U laptop, **Wi-Fi only**, Debian 13.7, same kernel and package versions |
 | Python | 3.13.5 |
 | LXC / dnsmasq / nftables / rsync / zstd / OpenSSH | 6.0.4 / 2.91 / 1.1.3 / 3.5.0 / 1.5.7 / 10.0p2 |
 | Proxmox VE | proxmox-ve 9.2.0, pve-manager 9.2.26, kernel 7.0.14-pve |
 | Proxmox QEMU (node and bundle) | pve-qemu-kvm 11.1.3-1, qemu-server 9.2.15 |
 | swtpm / LXC on nodes / pve-container / ZFS | 0.10.2+pve1 / lxc-pve 7.0.0-2 / 6.1.18 / 2.4.4-pve1 |
 | Source node CPU | Intel Core i7-10700 |
-| Guest storage | ZFS (`zfspool`), raw zvols and ZFS subvolumes |
+| Guest storage | ZFS (`zfspool`): raw zvols and subvolumes; **LVM-thin** (`lvmthin`) |
 
 **Results**
 
@@ -186,16 +191,18 @@ and during the moves, and they were re-verified after every step.
 | **Live UEFI + TPM return** | 95 ms downtime |
 | Uninstall steps below | ok, nothing left behind |
 
-**Carried over from the predecessor and not re-tested with 1.0.0.** The move, sync and return
-code paths are the same, but these setups were not repeated in this release's test run:
+**Host B (AMD, Wi-Fi):**
 
-- live moves over Wi-Fi, including a 10 MB/s write storm during the return
-- live moves between Intel and AMD CPUs
-- USB passthrough by vendor:product during a cold move
-- HA-managed guests
-- LVM-backed volumes
+| Test | Result |
+|---|---|
+| **Live VM move Intel -> AMD over Wi-Fi**, guest **HA-managed**, writing a 5 MB file every second throughout | pre-seed 20 GiB at 109 MiB/s, **274 ms downtime**, no reboot, all files and in-flight writes intact; HA entry removed while away |
+| **Live VM return AMD -> Intel over Wi-Fi**, still under write load | **299 ms downtime**; all 400 writes made during both moves verified; HA re-added with its `max_restart` and comment, state `started` |
+| **Cold VM move from LVM-thin** with `usb0: host=0bda:0129` (by vendor:product) and `usb1: host=1-2` (by port) | 20 GiB at 105 MiB/s over Wi-Fi, sha256 verified; the USB device (plugged into host B) attached inside the guest; the port-based entry was dropped |
+| **Cold VM return to LVM-thin** with full sha256 verify | parked LVM volume identical to host B's copy; both USB entries unchanged in the Proxmox config; a file written on host B arrived |
+| Preflight on LVM-thin | counts only the allocated part (1.3 of 20 GiB) after the fix in this release |
 
-All of these were tested and worked in the earlier, multi-machine version of this code.
+Not tested: thick (non-thin) LVM, Proxmox VE 8.x, other Debian versions on the portable host, and
+the node-upgrade use case below.
 
 ---
 
@@ -470,12 +477,53 @@ Recovery points while a guest is away, newest first:
 
 ---
 
+## Use case: empty a node for maintenance or an upgrade
+
+Have a node to reboot or upgrade, and nowhere else to put a guest that can't stop? Park it on the
+portable host while you work on the node, then bring it back.
+
+> **Untested.** This combines features that were tested on their own (live move out, live and cold
+> return), but the whole sequence across a real Proxmox upgrade has **not** been tested. Neither
+> has any other Proxmox VE version than the one in the table above, newer or older. Try it on a
+> throwaway guest first.
+
+1. **Before the upgrade**, make sure this host's QEMU matches the node: `sudo proxmox-portable
+   fetch-qemu`.
+2. **Move the guest here live** from the console. Set the sync interval to `off` for the
+   duration. Syncs need the node, so they would fail while it reboots. A failed sync loses
+   nothing; it just fails.
+3. **Do the maintenance or upgrade** on the node and reboot it. Leave the parked guest alone: it
+   must stay stopped, and the tag must stay.
+4. **Bring it back:**
+   - **Live return (try first).** This moves the guest from this host's older QEMU to the node's
+     newer one. That is the same direction Proxmox's own rolling upgrades rely on, and QEMU keeps
+     the guest on its old machine type (e.g. `pc-q35-11.1+pve0`), which newer QEMU versions still
+     run. It should usually work. If the target refuses, the job stops the half-started target and
+     the guest keeps running here.
+   - **Cold return (always works).** Shut down here, final sync, optional sha256 verify, then it
+     starts on the upgraded node. It is a reboot, but there is no version dependency.
+5. Afterwards, run `sudo proxmox-portable fetch-qemu` again, so the next live move *out* of the
+   upgraded node works. A live move needs this host's QEMU to be at least as new as the source's.
+
+Caveats:
+- It returns only to the node it came from. To use a different node, return it home, then use
+  Proxmox's Migrate.
+- A major upgrade (for example 8 -> 9) changes much more than QEMU. Prefer a cold return there.
+- In LAN mode the host must stay on the guest's LAN for the whole time.
+
+---
+
 ## Networking
 
 | Mode | What the guest gets | Works when |
 |---|---|---|
 | **LAN** (keep IP) | its old IP, gateway and DNS. This host routes a /32 to the bridge `ppbr0`, answers ARP for the guest on the LAN (proxy ARP), hands it its address by DHCP (static lease by MAC), rewrites guest frames to the bridge MAC (so a live-moved guest with the router's MAC cached keeps working) and sends gratuitous ARP on arrival | this host is on the guest's LAN, wired or Wi-Fi |
 | **NAT** | a new address from `nat_network` (default 10.77.0.x) by DHCP, with DNS from this host, masqueraded out | always, including away from home. The guest must use DHCP. A container with a static IP in its Proxmox config keeps that static IP and has no connectivity in NAT mode. |
+
+A guest that gets its address by DHCP **without a reservation** keeps it while it runs here (this
+host hands out a static lease). But a cold move or cold return is a reboot, and after a reboot
+the LAN's DHCP server may give it a different address, as with any reboot. Give such guests a
+DHCP reservation or a static IP if their address matters.
 
 Only guest NICs on one of the `lan_bridges` (default `vmbr0`) can use LAN mode. NICs on other
 node bridges go to the NAT bridge.
@@ -504,7 +552,7 @@ node bridges go to the NAT bridge.
 
 ## Limits
 
-- Raw volumes only (ZFS, LVM/LVM-thin, raw files), not qcow2.
+- Raw volumes only (ZFS, LVM-thin, LVM, raw files), not qcow2. Tested: ZFS and LVM-thin.
 - **Live moves need:**
   - the VM running
   - no passthrough devices

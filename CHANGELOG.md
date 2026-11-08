@@ -6,6 +6,25 @@ All notable changes to proxmox-portable. Newest first.
 
 ### Added
 - MIT license (`LICENSE`), linked from the README.
+- README: "Use case: empty a node for maintenance or an upgrade". It covers live moving a guest out
+  of a node, upgrading the node, then returning it live (older QEMU to newer, the direction
+  rolling upgrades use) or cold. The section is marked **untested**, with any Proxmox version
+  other than the tested one too.
+- README: a note that a DHCP guest without a reservation can get a new address after a cold
+  move or return (it is a reboot).
+
+### Fixed
+- Preflight counted a thin LVM volume as fully used (20 of 20 GiB), which made the free-space check
+  too strict. It now reads `data_percent` from `lvs` (1.3 of 20 GiB in the test). Thick LVM still
+  counts the full size, which is correct.
+
+### Tested
+The five setups 1.0.0 had only inherited from its predecessor were re-tested on a second portable
+host, an AMD Ryzen 5 3500U laptop on Wi-Fi only:
+- live VM move Intel -> AMD over Wi-Fi, HA-managed guest under constant writes: 274 ms downtime
+- live return AMD -> Intel: 299 ms; HA re-added with its settings; all 400 in-flight writes intact
+- cold move from LVM-thin with USB by vendor:product (attached on the host) and by port (dropped)
+- cold return to LVM-thin, sha256 identical, USB config unchanged
 
 ## 1.0.0 - 2026-11-08
 
