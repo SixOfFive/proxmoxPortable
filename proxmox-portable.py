@@ -16,6 +16,7 @@ Usage:  proxmox-portable [--config FILE] COMMAND [ARGS]
   serve                     web console + scheduler (what the systemd unit runs)
   setup                     install Debian packages, directories, SSH key, systemd unit
   fetch-qemu [NODE_IP]      copy Proxmox's QEMU/swtpm/OVMF from a node into the bundle
+  fetch-novnc               unpack Debian's noVNC files (web VNC console) without installing the package
   check                     check config, cluster access, SSH and the QEMU bundle
   hash-password             print a password_hash line for the config file
   status | list | vm-status ID | jobs | job ID | history [ID]
@@ -25,6 +26,7 @@ Internal: _run-job ID | ifup TAP | ifdown TAP
 
 Config file: /etc/proxmox-portable/proxmox-portable.conf (see proxmox-portable.conf.example).
 """
+import base64
 import configparser
 import fcntl
 import getpass
@@ -49,7 +51,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_CONF = "/etc/proxmox-portable/proxmox-portable.conf"
 SELF = os.path.realpath(__file__)
 QRUN = "/var/run/qemu-server"          # Proxmox's command lines expect their sockets here
@@ -123,6 +125,7 @@ def load_config(path):
     # [paths]
     C.data = g("paths", "data_dir", "/var/lib/proxmox-portable")
     C.pveq = g("paths", "qemu_bundle", "/opt/proxmox-portable/pve-qemu")
+    C.novnc = g("paths", "novnc_dir", "/opt/proxmox-portable/novnc")
     # [defaults]
     C.shutdown_timeout = int(g("defaults", "shutdown_timeout", "180"))
     C.sync_default = g("defaults", "sync_interval", "hourly")
@@ -624,7 +627,7 @@ def cmd_host_status(args=None):
         "ifaces": iface_addrs(), "default_iface": default_iface(), "lan_iface": lan_iface(),
         "bridge": C.bridge, "nat_bridge": C.nat_bridge, "nat_network": str(C.nat_net.network),
         "tailscale": run(["tailscale", "ip", "-4"], check=False).strip() if shutil.which("tailscale") else "",
-        "battery": battery(), "guests": list_guests(),
+        "battery": battery(), "guests": list_guests(), "novnc": os.path.exists(C.novnc + "/core/rfb.js"),
     }
 
 
@@ -970,7 +973,11 @@ def leaf_rewrite(node, newfile, fmt=None):
     leaf = chain[-1]
     leaf["driver"] = "file"
     leaf["filename"] = newfile
-    if fmt and len(chain) >= 2:
+    if fmt and len(chain) >= 2 and chain[-2].get("driver") != fmt:
+        # a qcow2 source runs here on raw/qcow2 files: keep only the options every format accepts
+        keep = {"driver", "node-name", "file", "discard", "cache", "read-only", "auto-read-only", "force-share", "detect-zeroes"}
+        for k in [k for k in chain[-2] if k not in keep]:
+            del chain[-2][k]
         chain[-2]["driver"] = fmt
     return node
 
@@ -1289,14 +1296,63 @@ def vm_lock(vmid):
 
 
 # ================================================================ shared import/return pieces
+# Read a non-raw image (qcow2) on a node as raw bytes to stdout: Proxmox's own qemu-nbd serves it
+# read-only on a private unix socket and this minimal NBD client reads it front to back.
+# (qemu-img convert/dd can't write to a pipe.)
+PVE_NBDCAT_PY = r'''
+import os,shutil,socket,struct,subprocess,sys,tempfile,time
+path,fmt=sys.argv[1],sys.argv[2]
+d=tempfile.mkdtemp(prefix="pp-nbd-");sock=d+"/s";pidf=d+"/pid"
+subprocess.run(["qemu-nbd","-r","-f",fmt,"-k",sock,"--fork","--pid-file",pidf,"-x","pp",path],check=True)
+try:
+    s=socket.socket(socket.AF_UNIX);s.connect(sock);f=s.makefile("rwb",buffering=0)
+    def rx(n):
+        b=b""
+        while len(b)<n:
+            c=f.read(n-len(b))
+            if not c: raise SystemExit("nbd: connection closed")
+            b+=c
+        return b
+    if rx(16)!=b"NBDMAGICIHAVEOPT": raise SystemExit("nbd: bad greeting")
+    hf=struct.unpack("!H",rx(2))[0]
+    f.write(struct.pack("!I",3 if hf&2 else 1))
+    f.write(b"IHAVEOPT"+struct.pack("!II",1,2)+b"pp")
+    size,tf=struct.unpack("!QH",rx(10))
+    if not hf&2: rx(124)
+    out=sys.stdout.buffer;CH=4<<20;nxt=0;done=0;sent={};got={}
+    while done<size:
+        while nxt<size and len(sent)+len(got)<8:   # keep up to 8 reads in flight
+            n=min(CH,size-nxt);f.write(struct.pack("!IHHQQI",0x25609513,0,0,nxt,nxt,n));sent[nxt]=n;nxt+=n
+        mg,err,hh=struct.unpack("!IIQ",rx(16))
+        if mg!=0x67446698 or err or hh not in sent: raise SystemExit("nbd: read error %d at %d"%(err,hh))
+        got[hh]=rx(sent.pop(hh))
+        while done in got:   # replies may come out of order: write in order
+            b=got.pop(done);out.write(b);done+=len(b)
+    out.flush()
+    f.write(struct.pack("!IHHQQI",0x25609513,0,2,0,0,0))
+finally:
+    try: os.kill(int(open(pidf).read()),15)
+    except Exception: pass
+    time.sleep(0.2);shutil.rmtree(d,ignore_errors=True)
+'''
+SUPPORTED_FORMATS = ("raw", "qcow2")
+
+
+def remote_reader(path, fmt):
+    """Shell command (run on a node) that writes a volume's guest-visible contents to stdout."""
+    if fmt == "raw":
+        return "dd if=%s bs=4M status=none" % shlex.quote(path)
+    return "python3 -c %s %s %s" % (shlex.quote(PVE_NBDCAT_PY), shlex.quote(path), shlex.quote(fmt))
+
+
 def stream_volume(m, dk, log, jid, label):
     """Copy one Proxmox volume to a sparse local raw file, sha256-verified on both ends."""
     ip = m["origin_ip"]
     path, size = dk["pve_path"], dk["size"]
     dst = vmdir(m["vmid"]) + "/" + dk["base"]
     log("copying %s (%s, %.2f GiB) from %s:%s" % (dk["key"], dk["volid"], size / 2**30, m["origin_node"], path))
-    remote = ("set -o pipefail; f=$(mktemp); dd if=%s bs=4M status=none | tee >(sha256sum | cut -c1-64 > $f) "
-              "| zstd -1 -T2 -q; rc=$?; sleep 1; echo \"PPSHA $(cat $f)\" >&2; rm -f $f; exit $rc") % shlex.quote(path)
+    remote = ("set -o pipefail; f=$(mktemp); %s | tee >(sha256sum | cut -c1-64 > $f) "
+              "| zstd -1 -T2 -q; rc=$?; sleep 1; echo \"PPSHA $(cat $f)\" >&2; rm -f $f; exit $rc") % remote_reader(path, dk.get("pve_format", "raw"))
     ssh = subprocess.Popen(pve_ssh_cmd(ip) + ["bash -c " + shlex.quote(remote)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     unz = subprocess.Popen(["zstd", "-d", "-q", "-c"], stdin=ssh.stdout, stdout=subprocess.PIPE)
     ssh.stdout.close()
@@ -1336,9 +1392,13 @@ def stream_volume(m, dk, log, jid, label):
 
 def volume_info(ip, volid):
     path = pve(ip, "pvesm path %s" % shlex.quote(volid)).strip()
-    fmt = "raw" if path.startswith("/dev/") else json.loads(
-        pve(ip, "qemu-img info --output=json %s" % shlex.quote(path))).get("format", "raw")
-    size = int(pve(ip, "blockdev --getsize64 %s 2>/dev/null || stat -c %%s %s" % (shlex.quote(path), shlex.quote(path))).strip())
+    if not path.startswith("/dev/"):
+        # an image file (dir/NFS/CIFS storage): qcow2 or raw; -U because a running VM holds its lock
+        info = json.loads(pve(ip, "qemu-img info -U --output=json %s" % shlex.quote(path)))
+        size = int(info.get("virtual-size", 0))
+        return path, info.get("format", "raw"), size, int(info.get("actual-size") or size)
+    fmt = "raw"
+    size = int(pve(ip, "blockdev --getsize64 %s" % shlex.quote(path)).strip())
     used = size
     if path.startswith("/dev/zvol/"):
         try:
@@ -1615,8 +1675,8 @@ def do_import(p, log, jid):
             m["disks"].append({**dk, "base": None})
             continue
         path, fmt, size, used = volume_info(ip, dk["volid"])
-        if fmt != "raw":
-            raise RuntimeError("%s is %s; only raw volumes (ZFS/LVM zvols, raw files) are supported" % (dk["key"], fmt))
+        if fmt not in SUPPORTED_FORMATS:
+            raise RuntimeError("%s is %s; supported: raw (ZFS, LVM, raw files) and qcow2" % (dk["key"], fmt))
         base = {"disk": "%s.base.raw" % dk["key"], "cloudinit": "%s.iso" % dk["key"], "efi": "efivars.raw",
                 "tpm": "tpmstate.raw"}[dk["kind"]]
         dk.update({"pve_path": path, "pve_format": fmt, "size": size, "used": used, "base": base, "overlays": []})
@@ -1714,7 +1774,9 @@ def import_live(m, p, log, jid, status):
     # while the VM runs (empty space costs ~nothing). The mirror later sends only dirty blocks.
     bitmaps = []
     for dk in mirrored:
-        if dk["kind"] == "disk":
+        if dk["kind"] == "disk" and dk.get("pve_format", "raw") != "raw":
+            log("%s is %s: no pre-seed, it is mirrored in full" % (dk["key"], dk.get("pve_format")))
+        elif dk["kind"] == "disk":
             try:
                 pve_qmp(ip, vmid, "block-dirty-bitmap-add", {"node": "drive-" + dk["key"], "name": "pp-" + dk["key"]})
                 bitmaps.append(dk["key"])
@@ -1925,8 +1987,12 @@ def sync_locked(m, log, jid):
                 sp = subprocess.run(pve_ssh_cmd(ip) + ["cat > %s/%s.small" % (rdir, dk["key"])], input=data, capture_output=True)
                 if sp.returncode:
                     raise RuntimeError("shipping %s failed" % dk["key"])
-                small_cmds.append("dd if=%s.small of=%s bs=64k conv=notrunc status=none && rm -f %s.small" % (
-                    dk["key"], shlex.quote(dk["pve_path"]), dk["key"]))
+                if dk.get("pve_format", "raw") == "raw":
+                    small_cmds.append("dd if=%s.small of=%s bs=64k conv=notrunc status=none && rm -f %s.small" % (
+                        dk["key"], shlex.quote(dk["pve_path"]), dk["key"]))
+                else:
+                    small_cmds.append("qemu-img convert -n -f raw -O %s %s.small %s && rm -f %s.small" % (
+                        dk["pve_format"], dk["key"], shlex.quote(dk["pve_path"]), dk["key"]))
                 small_new[dk["key"]] = h
     disk_by = {dk["key"]: dk for dk in disks}
     commits = "\n".join("qemu-img rebase -u -F %s -b %s %s && qemu-img commit -d -q %s && rm -f %s" % (
@@ -1988,7 +2054,7 @@ def do_return(p, log, jid):
     if m["state"] != "on-host":
         raise RuntimeError("guest %d state is %s" % (vmid, m["state"]))
     live = p.get("move") == "live"
-    log("%s return of VM %d (%s) to %s" % ("LIVE" if live else "cold", vmid, m["name"], m["origin_node"]))
+    log("%s return of VM %d (%s) to %s" % ("LIVE" if live else "cold", vmid, m["name"], return_target(m, p)))
     if live:
         if vm_state(m) != "running":
             raise RuntimeError("a live return needs the VM running on this host")
@@ -1999,6 +2065,7 @@ def do_return(p, log, jid):
     try:
         log("final sync")
         sync_locked(m, log, jid)
+        relocate_parked(m, p.get("target_node"), log, jid)
         if p.get("verify", True):
             verify(m, log, jid)
     except Exception:
@@ -2010,11 +2077,47 @@ def do_return(p, log, jid):
     return {"returned": True}
 
 
+def return_target(m, p):
+    t = p.get("target_node")
+    return m["origin_node"] if not t or t == m["origin_node"] else "%s (home node %s)" % (t, m["origin_node"])
+
+
+def relocate_parked(m, target, log, jid):
+    """Move the parked (stopped, synced) copy to another node with Proxmox's own offline migration,
+    so the guest returns there. Replication, if set up to that node, makes this quick."""
+    if not target or target == m["origin_node"]:
+        return
+    vmid, kind = m["vmid"], m["kind"]
+    tip = node_ips().get(target)
+    if not tip:
+        raise RuntimeError("node %s not found in the cluster" % target)
+    log("moving the parked copy of %d from %s to %s (offline %s migrate)" % (vmid, m["origin_node"], target, pve_cmd(kind)))
+    job_progress(jid, step="migrate parked copy to " + target, done=0, total=1)
+    if pve_status(m["origin_ip"], m["origin_node"], vmid, kind) == "running":
+        raise RuntimeError("the parked copy is running on %s - refusing" % m["origin_node"])
+    try:
+        pve(m["origin_ip"], "%s migrate %d %s" % (pve_cmd(kind), vmid, shlex.quote(target)), timeout=86400)
+    except RuntimeError as e:
+        raise RuntimeError("moving the parked copy to %s failed: %s" % (target, str(e).split(": ", 1)[-1]))
+    m.setdefault("relocations", []).append({"time": int(time.time()), "from": m["origin_node"], "to": target})
+    m["origin_node"], m["origin_ip"] = target, tip
+    if kind == "qemu":
+        cfg = pve_config(tip, target, vmid)
+        for dk in m["disks"]:
+            if dk.get("pve_path") and cfg.get(dk["key"]):
+                vol = parse_opts(cfg[dk["key"]])[0]
+                path, fmt, size, used = volume_info(tip, vol)
+                dk.update(volid=vol, pve_path=path, pve_format=fmt)
+    save_meta(m)
+    log("parked copy is now on %s" % target)
+
+
 def verify(m, log, jid):
     for dk in [x for x in m["disks"] if x["kind"] == "disk"]:
         job_progress(jid, step="verify " + dk["key"], done=0, total=dk["size"])
         log("verifying %s: sha256 of the local copy vs %s" % (dk["key"], dk["pve_path"]))
-        rp = subprocess.Popen(pve_ssh_cmd(m["origin_ip"]) + ["sha256sum %s | cut -c1-64" % shlex.quote(dk["pve_path"])],
+        rp = subprocess.Popen(pve_ssh_cmd(m["origin_ip"]) + ["set -o pipefail; %s | sha256sum | cut -c1-64" % remote_reader(
+                              dk["pve_path"], dk.get("pve_format", "raw"))],
                               stdout=subprocess.PIPE, text=True)
         lsha = sha_file(vmdir(m["vmid"]) + "/" + dk["base"])
         rsha = rp.communicate()[0].strip()
@@ -2048,10 +2151,12 @@ def return_live(m, p, log, jid):
     try:
         log("pre-sync: bring the parked disks up to date while the VM keeps running")
         sync_locked(m, log, jid)
+        relocate_parked(m, p.get("target_node"), log, jid)
     except Exception:
         m["state"] = "on-host"
         save_meta(m)
         raise
+    ip, node = m["origin_ip"], m["origin_node"]
     machine = record_machine(m) or m.get("machine")
     log("this host runs machine %s" % machine)
     argv = shlex.split(pve(ip, "qm showcmd %d" % vmid).strip())
@@ -2396,7 +2501,7 @@ def ct_return(p, log, jid):
     m = load_meta(vmid)
     if m["state"] != "on-host":
         raise RuntimeError("guest %d state is %s" % (vmid, m["state"]))
-    log("return of CT %d (%s) to %s" % (vmid, m["name"], m["origin_node"]))
+    log("return of CT %d (%s) to %s" % (vmid, m["name"], return_target(m, p)))
     m["state"] = "returning"
     save_meta(m)
     try:
@@ -2411,6 +2516,7 @@ def ct_return(p, log, jid):
                 run(["lxc-stop", "-n", ct_name(m), "-k"])
         log("final sync (CT stopped)")
         ct_sync_locked(m, log, jid)
+        relocate_parked(m, p.get("target_node"), log, jid)
     except Exception:
         m["state"] = "on-host"
         save_meta(m)
@@ -2597,6 +2703,20 @@ def start_return(p):
     if job_running(m["vmid"]):
         raise UserError("a job for %d is already running" % m["vmid"])
     p["kind"] = m["kind"]
+    if p.get("target_node") == m["origin_node"]:
+        p["target_node"] = None
+    if p.get("target_node"):
+        t = p["target_node"]
+        if t not in node_ips():
+            raise UserError("no node %s in the cluster" % t)
+        # check before anything is stopped: the guest's storages must exist on the target node
+        avail = {x["storage"] for x in pve_api("/nodes/%s/storage" % t) if x.get("active") and x.get("enabled", 1)}
+        vols = [d.get("volid") for d in m.get("disks", []) if d.get("pve_path")]
+        vols += [parse_opts(v)[0] for k, v in m["pve_config"].items() if k == "rootfs" or MP_RE.match(k)]
+        need = {v.split(":", 1)[0] for v in vols if v and ":" in v and not v.startswith("/")}
+        if need - avail:
+            raise UserError("node %s lacks storage %s used by guest %d; return it home instead"
+                            % (t, ", ".join(sorted(need - avail)), m["vmid"]))
     return {"ok": True, "job": new_job("return", m["vmid"], p)}
 
 
@@ -2648,8 +2768,8 @@ def cmd_preflight(node, ip, vmid, kind):
             continue
         try:
             path, fmt, size, used = volume_info(ip, dk["volid"])
-            if fmt != "raw":
-                probs.append("%s is %s (only raw/ZFS/LVM volumes)" % (dk["key"], fmt))
+            if fmt not in SUPPORTED_FORMATS:
+                probs.append("%s is %s (supported: raw and qcow2)" % (dk["key"], fmt))
             need += used
             disks.append({"key": dk["key"], "volid": dk["volid"], "path": path, "size": size, "used": used, "format": fmt,
                           "action": {"disk": "block copy, then changed-block sync", "efi": "copy (EFI vars)",
@@ -2719,6 +2839,10 @@ WantedBy=multi-user.target
 """ % (C.port, sys.executable, SELF, C.path)
     with open("/etc/systemd/system/proxmox-portable.service", "w") as f:
         f.write(unit)
+    try:
+        cmd_fetch_novnc([])
+    except Exception as e:
+        print("WARNING: noVNC not unpacked (%s); the web console needs it: run `fetch-novnc` later" % e)
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "proxmox-portable.service"])
     print("\nsetup done.\n\nAdd this public key to the cluster (on ANY Proxmox node, as root):\n")
@@ -2792,6 +2916,33 @@ def cmd_fetch_qemu(args):
     return None
 
 
+def cmd_fetch_novnc(args):
+    """Unpack Debian's noVNC (static JS) into novnc_dir. Only its files are used, so the package's
+    dependencies (nodejs, websockify) are not needed: the WebSocket bridge is built into this script."""
+    need_root()
+    tmp = run(["mktemp", "-d", "/tmp/proxmox-portable-novnc.XXXXXX"]).strip()
+    try:
+        subprocess.run(["apt-get", "download", "novnc"], cwd=tmp, check=True, capture_output=True)
+        deb = [f for f in os.listdir(tmp) if f.startswith("novnc_") and f.endswith(".deb")]
+        if not deb:
+            raise UserError("apt-get download novnc gave no package")
+        run(["dpkg", "-x", tmp + "/" + deb[0], tmp + "/x"])
+        src = tmp + "/x/usr/share/novnc"
+        if not os.path.exists(src + "/core/rfb.js"):
+            raise UserError("the novnc package has no core/rfb.js")
+        shutil.rmtree(C.novnc + ".new", ignore_errors=True)
+        shutil.copytree(src, C.novnc + ".new", symlinks=True)
+        cp = tmp + "/x/usr/share/doc/novnc/copyright"
+        if os.path.exists(cp):
+            shutil.copy(cp, C.novnc + ".new/COPYRIGHT.debian")
+        shutil.rmtree(C.novnc, ignore_errors=True)
+        os.rename(C.novnc + ".new", C.novnc)
+        print("noVNC %s unpacked to %s" % (urllib.parse.unquote(deb[0].split("_")[1]), C.novnc))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return None
+
+
 def cmd_check(args):
     ok = True
 
@@ -2820,6 +2971,8 @@ def cmd_check(args):
             line(False, "root SSH to %s (%s)" % (n["name"], n.get("ip")), str(e)[-200:])
     line(os.path.exists(C.kvm), "Proxmox QEMU bundle " + C.pveq,
          (run([C.kvm, "--version"], check=False).splitlines() or [""])[0] if os.path.exists(C.kvm) else "run fetch-qemu")
+    line(os.path.exists(C.novnc + "/core/rfb.js"), "noVNC for the web console " + C.novnc,
+         "" if os.path.exists(C.novnc + "/core/rfb.js") else "run fetch-novnc")
     for t in ("lxc-start", "rsync", "zstd", "qemu-img", "dnsmasq", "nft", "ssh"):
         line(bool(shutil.which(t)), "tool " + t)
     gw = host_gateway()
@@ -3026,6 +3179,7 @@ def api_import(q, post):
 def api_return(q, post):
     need_post(post)
     p = {"vmid": int(q.get("vmid", 0)), "move": "live" if q.get("move") == "live" else "cold",
+         "target_node": v_node(q["target_node"]) if q.get("target_node") else None,
          "start": q.get("start", "1") == "1", "verify": q.get("verify", "1") == "1",
          "delete_local": q.get("delete_local", "1") == "1", "force_stop": q.get("force_stop") == "1",
          "shutdown_timeout": max(30, min(1800, int(q.get("shutdown_timeout") or 180)))}
@@ -3068,10 +3222,26 @@ def api_pvepower(q, post):
     return {"ok": True, "upid": pve_api("/nodes/%s/%s/%d/status/%s" % (n, t, vmid, act), "POST")}
 
 
+def api_vncticket(q, post):
+    """A fresh VNC password for one console session (QEMU's VNC socket is password-protected)."""
+    need_post(post)
+    vmid = int(q.get("vmid", 0))
+    m = load_meta(vmid)
+    if m["kind"] != "qemu" or m.get("state") not in ("on-host", "returning") or not vm_pid(vmid):
+        raise ApiError("VM %d is not running on this host" % vmid)
+    if not os.path.exists(C.novnc + "/core/rfb.js"):
+        raise ApiError("noVNC is missing on this host: run `proxmox-portable fetch-novnc`")
+    if not os.path.exists("%s/%d.vnc" % (QRUN, vmid)):
+        raise ApiError("VM %d has no VNC socket" % vmid)
+    pw = "".join(secrets.choice("abcdefghijkmnpqrstuvwxyzACDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+    qmp(qmp_path(vmid), "set_password", {"protocol": "vnc", "password": pw})
+    return {"ok": True, "password": pw, "name": m["name"], "vmid": vmid}
+
+
 API = {"tree": api_tree, "cluster": api_cluster, "node": api_node, "guest": api_guest, "host": api_host,
        "lguest": api_lguest, "preflight": api_preflight, "jobs": api_jobs, "job": api_job, "pvetask": api_pvetask,
        "import": api_import, "return": api_return, "sync": api_sync, "setsync": api_setsync,
-       "lpower": api_lpower, "pvepower": api_pvepower}
+       "lpower": api_lpower, "pvepower": api_pvepower, "vncticket": api_vncticket}
 
 
 # ================================================================ web console: HTTP server
@@ -3114,8 +3284,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        host = re.sub(r"[^A-Za-z0-9.:\[\]-]", "", self.headers.get("Host", ""))   # WebSocket only back to this host
         self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-                         "script-src 'self'; frame-ancestors 'none'")
+                         "script-src 'self'; connect-src 'self'%s; frame-ancestors 'none'"
+                         % ((" wss://%s ws://%s" % (host, host)) if host else ""))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -3154,6 +3326,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, APP_JS, "application/javascript; charset=utf-8")
         if u.path == "/app.css":
             return self.send(200, APP_CSS, "text/css; charset=utf-8")
+        if u.path in ("/console", "/console.js", "/vncws") or u.path.startswith("/novnc/"):
+            if not self.session():
+                if u.path == "/console":
+                    return self.send(302, "", "text/plain", {"Location": "/"})
+                return self.send(401, "login required\n", "text/plain")
+            if u.path == "/console":
+                return self.send(200, CONSOLE_HTML, "text/html; charset=utf-8")
+            if u.path == "/console.js":
+                return self.send(200, CONSOLE_JS, "application/javascript; charset=utf-8")
+            if u.path == "/vncws":
+                return self.ws_vnc(u)
+            return self.static_novnc(u.path[len("/novnc/"):])
         if u.path != "/api":
             return self.send(404, "not found\n", "text/plain")
         q = {k: v[-1] for k, v in urllib.parse.parse_qs(u.query).items()}
@@ -3190,6 +3374,110 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(400, {"ok": False, "error": str(e)})
         except Exception as e:
             return self.send(500, {"ok": False, "error": str(e)})
+
+    MIME = {".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".html": "text/html; charset=utf-8",
+            ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
+            ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf", ".oga": "audio/ogg", ".mp3": "audio/mpeg"}
+
+    def static_novnc(self, rel):
+        base = os.path.realpath(C.novnc)
+        path = os.path.realpath(os.path.join(base, urllib.parse.unquote(rel)))
+        if not path.startswith(base + "/") or not os.path.isfile(path):
+            return self.send(404, "not found\n", "text/plain")
+        ext = os.path.splitext(path)[1].lower()
+        with open(path, "rb") as f:
+            return self.send(200, f.read(), self.MIME.get(ext, "application/octet-stream"),
+                             {"Cache-Control": "max-age=3600"})
+
+    def ws_vnc(self, u):
+        """WebSocket <-> the VM's VNC unix socket (what websockify does, built in)."""
+        q = urllib.parse.parse_qs(u.query)
+        try:
+            vmid = int((q.get("vmid") or ["0"])[0])
+        except ValueError:
+            vmid = 0
+        origin = self.headers.get("Origin", "")
+        host = self.headers.get("Host", "")
+        if not origin or urllib.parse.urlsplit(origin).netloc != host:
+            return self.send(403, "bad origin\n", "text/plain")
+        key = self.headers.get("Sec-WebSocket-Key")
+        if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
+            return self.send(400, "websocket expected\n", "text/plain")
+        m = load_json(vmdir(vmid) + "/meta.json") if vmid else None
+        vsock = "%s/%d.vnc" % (QRUN, vmid)
+        if not m or m.get("kind") != "qemu" or not vm_pid(vmid) or not os.path.exists(vsock):
+            return self.send(404, "no running VM %d here\n" % vmid, "text/plain")
+        try:
+            vnc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            vnc.connect(vsock)
+        except OSError as e:
+            return self.send(502, "VNC: %s\n" % e, "text/plain")
+        acc = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        hdr = ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", "Sec-WebSocket-Accept: " + acc]
+        protos = [x.strip() for x in self.headers.get("Sec-WebSocket-Protocol", "").split(",") if x.strip()]
+        if "binary" in protos:
+            hdr.append("Sec-WebSocket-Protocol: binary")
+        self.wfile.write(("\r\n".join(hdr) + "\r\n\r\n").encode())
+        self.close_connection = True
+        lock = threading.Lock()
+
+        def send_frame(op, data):
+            n = len(data)
+            head = bytes([0x80 | op]) + (bytes([n]) if n < 126 else
+                                           struct.pack("!BH", 126, n) if n < 65536 else struct.pack("!BQ", 127, n))
+            with lock:
+                self.wfile.write(head + data)
+
+        def from_browser():
+            rf = self.rfile
+            try:
+                while True:
+                    h = rf.read(2)
+                    if len(h) < 2:
+                        break
+                    op, n = h[0] & 0x0F, h[1] & 0x7F
+                    if n == 126:
+                        n = struct.unpack("!H", rf.read(2))[0]
+                    elif n == 127:
+                        n = struct.unpack("!Q", rf.read(8))[0]
+                    mask = rf.read(4) if h[1] & 0x80 else b""
+                    data = rf.read(n)
+                    if mask:
+                        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+                    if op == 8:
+                        try:
+                            send_frame(8, data[:2])
+                        except OSError:
+                            pass
+                        break
+                    if op == 9:
+                        send_frame(10, data)
+                    elif op in (0, 1, 2):
+                        vnc.sendall(data)
+            except (OSError, ValueError, struct.error):
+                pass
+            finally:
+                try:
+                    vnc.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=from_browser, daemon=True)
+        t.start()
+        try:
+            while True:
+                d = vnc.recv(65536)
+                if not d:
+                    break
+                send_frame(2, d)
+        except OSError:
+            pass
+        finally:
+            vnc.close()
+            try:
+                send_frame(8, struct.pack("!H", 1000))
+            except OSError:
+                pass
 
     def login(self, q, ip, post):
         if not post:
@@ -3291,7 +3579,7 @@ def main():
             print("error: %s" % e, file=sys.stderr)
             sys.exit(2)
     table = {
-        "serve": cmd_serve, "setup": cmd_setup, "fetch-qemu": cmd_fetch_qemu, "check": cmd_check,
+        "serve": cmd_serve, "setup": cmd_setup, "fetch-qemu": cmd_fetch_qemu, "fetch-novnc": cmd_fetch_novnc, "check": cmd_check,
         "hash-password": cmd_hash_password,
         "status": cmd_host_status, "list": cmd_list, "vm-status": cmd_vm_status, "jobs": cmd_jobs, "job": cmd_job,
         "history": cmd_history,
@@ -3534,6 +3822,11 @@ pre.log { background: var(--code); border: 1px solid var(--line); padding: 8px; 
 }
 
 /* added for proxmox-portable */
+body.console { display: flex; flex-direction: column; height: 100vh; grid-template-rows: none; background: #000; }
+#cbar { display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: var(--head); border-bottom: 1px solid var(--line); color: var(--text); }
+#cbar .mark { background: var(--orange); color: #fff; font-weight: 700; padding: 1px 5px; border-radius: 2px; }
+#cbar .cr { margin-left: auto; display: flex; gap: 5px; }
+#screen { flex: 1; min-height: 0; overflow: hidden; }
 th.kcol { width: 180px; }
 .prewrap { white-space: pre-wrap; }
 .cin { padding: 4px; border: 1px solid var(--btn-b); background: var(--panel); }
@@ -3757,6 +4050,7 @@ function renderToolbar(k, n) {
       <button class="btn" data-lp="shutdown" ${!run ? 'disabled' : ''}>⏻ Shutdown</button>
       <button class="btn danger" data-lp="stop" ${!run ? 'disabled' : ''}>■ Stop</button>
       <button class="btn" data-lp="reboot" ${!run ? 'disabled' : ''}>↻ Reboot</button>
+      ${g.kind === 'lxc' ? '' : `<button class="btn" data-console="${g.vmid}" ${!run || !(S.tree.host || {}).novnc ? 'disabled' : ''} title="${(S.tree.host || {}).novnc ? 'Open the VNC console' : 'noVNC missing: run fetch-novnc'}">🖥 Console</button>`}
       <button class="btn" data-sync="1" ${!ok ? 'disabled' : ''}>⇅ Sync now</button>
       <button class="btn primary" data-tosub="return" ${!ok ? 'disabled' : ''}>⤺ Return to Proxmox</button>`;
   }
@@ -3767,6 +4061,7 @@ $('#toolbar').addEventListener('click', async e => {
   const n = flatFind(S.sel); if (!n) return;
   if (b.dataset.tosub) { S.sub = b.dataset.tosub; renderView(true); return; }
   if (b.dataset.goto) { select(b.dataset.goto); return; }
+  if (b.dataset.console) { window.open('console?vmid=' + b.dataset.console, 'pp-console-' + b.dataset.console, 'width=1060,height=860'); return; }
   if (b.dataset.pv) {
     const act = b.dataset.pv, g = n.data;
     if (act !== 'start' && !await confirmTyped(`${act} ${g.type === 'lxc' ? 'CT' : 'VM'} ${g.vmid} (${g.name}) on ${g.node}?`, act === 'stop' ? String(g.vmid) : null)) return;
@@ -4073,13 +4368,15 @@ PANELS.hvm = async (n, sub) => {
         : `<p><b>Live</b>: sync, then start a target QEMU on ${esc(m.origin_node)} (on the parked disks), mirror only the blocks changed since that sync, migrate RAM, ~0.1 s pause. <b>Cold</b>: shut down, final sync, optional full sha256 verify, start on ${esc(m.origin_node)}.</p>`}
       <div class="form" style="margin-top:10px">
       ${ct ? '' : `<label>Move type</label><select id="r-move"><option value="live" ${canLive ? 'selected' : 'disabled'}>Live (no downtime)</option><option value="cold" ${canLive ? '' : 'selected'}>Cold (shut down first)</option></select>`}
-      <label>Start on ${esc(m.origin_node)}</label><select id="r-start"><option value="1">yes</option><option value="0">no, leave it stopped</option></select>
+      <label>Return to node</label><select id="r-node">${(S.tree.resources || []).filter(x => x.type === 'node').sort((a, b) => a.node.localeCompare(b.node)).map(x => `<option value="${esc(x.node)}" ${x.node === m.origin_node ? 'selected' : ''} ${x.status !== 'online' ? 'disabled' : ''}>${esc(x.node)}${x.node === m.origin_node ? ' (home node)' : ''}${x.status !== 'online' ? ' (offline)' : ''}</option>`).join('')}</select>
+      <div class="help">Another node: after the final sync, Proxmox's own offline migration moves the parked copy there (quick when replication to that node exists), then the return finishes there. Its storage must exist on that node.</div>
+      <label>Start there</label><select id="r-start"><option value="1">yes</option><option value="0">no, leave it stopped</option></select>
       ${ct ? '' : '<label>Verify checksums (cold)</label><select id="r-verify"><option value="1">yes (recommended)</option><option value="0">no</option></select>'}
       <label>Local copy afterwards</label><select id="r-del"><option value="1">delete it</option><option value="0">keep the files</option></select>
       <label>Shutdown timeout (s)</label><input type="number" id="r-tmo" value="180" min="30" max="1800">
       <label>If it won't shut down</label><select id="r-force"><option value="0">abort (safe)</option><option value="1">force off</option></select>
       <label></label><div><button class="btn primary" id="r-go">⤺ Return to Proxmox</button></div></div></div></div>
-      <div class="note">To go back to a <i>different</i> node, return it to ${esc(m.origin_node)} first, then use Proxmox's normal Migrate. If a step fails it stays on this host (a failed live return resumes it here).</div>`;
+      <div class="note">If a step fails it stays on this host (a failed live return resumes it here).</div>`;
   }
   if (sub === 'jobs') return jobTable(r.jobs || []);
 };
@@ -4144,8 +4441,8 @@ function bindPanel(k, n) {
     const g = n.data;
     $('#r-go').onclick = async () => {
       const move = $('#r-move') ? $('#r-move').value : 'cold';
-      if (!await confirmTyped(`Return ${g.vmid} (${g.name}) from ${HN()} to Proxmox (${move === 'live' ? 'live, it keeps running' : 'it is stopped here first'})?`, String(g.vmid))) return;
-      const r = await api('return', { vmid: g.vmid, move, start: $('#r-start').value, verify: $('#r-verify') ? $('#r-verify').value : 0, delete_local: $('#r-del').value, force_stop: $('#r-force').value, shutdown_timeout: $('#r-tmo').value }, true);
+      if (!await confirmTyped(`Return ${g.vmid} (${g.name}) from ${HN()} to node ${$('#r-node').value} (${move === 'live' ? 'live, it keeps running' : 'it is stopped here first'})?`, String(g.vmid))) return;
+      const r = await api('return', { vmid: g.vmid, move, target_node: $('#r-node').value, start: $('#r-start').value, verify: $('#r-verify') ? $('#r-verify').value : 0, delete_local: $('#r-del').value, force_stop: $('#r-force').value, shutdown_timeout: $('#r-tmo').value }, true);
       if (!r.ok) { toast(r.error, true); return; }
       toast('Return job started: ' + r.job); openJob(r.job);
     };
@@ -4265,6 +4562,76 @@ window.addEventListener('hashchange', () => { const [id, sub] = decodeURICompone
 setInterval(() => { if (!document.hidden && !S.loggingIn) refresh(); }, 6000);
 setInterval(() => { if (!document.hidden && !S.loggingIn) refreshJobs(); }, 8000);
 '''
+
+
+CONSOLE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='10' rx='1' fill='%233892d4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css?v=""" + VERSION + r"""">
+</head>
+<body class="console">
+<div id="cbar"><span class="mark">PP</span> <b id="cname">Console</b> <span id="st" class="muted">connecting…</span>
+<span class="cr"><button class="btn" id="cad" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+<button class="btn" id="paste" title="Type the clipboard text into the VM (US keyboard layout)">Type clipboard</button>
+<button class="btn" id="fs" title="Full screen">⛶</button> <button class="btn" id="re" title="Reconnect">⟳</button></span></div>
+<div id="screen"></div>
+<script type="module" src="console.js?v=""" + VERSION + r""""></script>
+</body>
+</html>
+"""
+
+CONSOLE_JS = r"""// proxmox-portable: noVNC console for a VM running on this host.
+import RFB from './novnc/core/rfb.js';
+const $ = s => document.querySelector(s);
+const vmid = new URLSearchParams(location.search).get('vmid');
+let rfb = null;
+async function connect() {
+  $('#st').textContent = 'connecting…';
+  let j;
+  try {
+    const r = await fetch('api', { method: 'POST', headers: { 'X-PP': '1' }, body: new URLSearchParams({ a: 'vncticket', vmid }), credentials: 'same-origin' });
+    j = await r.json();
+  } catch (e) { $('#st').textContent = 'network error: ' + e.message; return; }
+  if (!j.ok) { $('#st').textContent = j.error || 'error'; return; }
+  document.title = `${j.vmid} (${j.name}) - Console`;
+  $('#cname').textContent = `VM ${j.vmid} (${j.name})`;
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/vncws?vmid=' + encodeURIComponent(vmid);
+  if (rfb) { try { rfb.disconnect(); } catch (e) {} }
+  $('#screen').innerHTML = '';
+  rfb = new RFB($('#screen'), url, { credentials: { password: j.password } });
+  rfb.scaleViewport = true;
+  rfb.resizeSession = false;
+  rfb.addEventListener('connect', () => { $('#st').textContent = 'connected'; rfb.focus(); });
+  rfb.addEventListener('disconnect', e => { $('#st').textContent = e.detail.clean ? 'disconnected' : 'connection lost - ⟳ to reconnect'; });
+  rfb.addEventListener('credentialsrequired', () => rfb.sendCredentials({ password: j.password }));
+  rfb.addEventListener('securityfailure', e => { $('#st').textContent = 'VNC refused: ' + (e.detail.reason || e.detail.status); });
+}
+$('#cad').onclick = () => rfb && rfb.sendCtrlAltDel();
+$('#re').onclick = connect;
+$('#fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+$('#paste').onclick = async () => {
+  if (!rfb) return;
+  let t = '';
+  try { t = await navigator.clipboard.readText(); } catch (e) { t = prompt('Text to type into the VM:') || ''; }
+  // VNC sends keysyms; QEMU turns them into scancodes and doesn't add Shift itself, so press it for
+  // characters that need it on a US layout.
+  const SHIFTED = '~!@#$%^&*()_+{}|:"<>?';
+  for (const ch of t) {
+    const code = ch === '\n' ? 0xff0d : ch === '\t' ? 0xff09 : ch.codePointAt(0);
+    const sym = code < 0x100 || code >= 0xff00 ? code : 0x01000000 + code;
+    const shift = (ch >= 'A' && ch <= 'Z') || SHIFTED.includes(ch);
+    if (shift) rfb.sendKey(0xffe1, 'ShiftLeft', true);
+    rfb.sendKey(sym);
+    if (shift) rfb.sendKey(0xffe1, 'ShiftLeft', false);
+  }
+  rfb.focus();
+};
+connect();
+"""
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ LAN while guests run on it.
   replication and scheduled backups keep covering it.
 - **Keeps its IP.** In LAN mode the guest keeps its address, over Wi-Fi too. In NAT mode it runs
   behind the portable host anywhere.
+- **Console in the browser:** a noVNC console for VMs running on the portable host.
+- **Return anywhere:** bring a guest back to its home node or to any other node.
+- **raw and qcow2:** ZFS, LVM/LVM-thin and raw files, plus qcow2 images on directory/NFS storage.
 
 ![layout](https://img.shields.io/badge/UI-Proxmox--style-e57000) ![deps](https://img.shields.io/badge/dependencies-python3%20stdlib-blue)
 
@@ -95,7 +98,17 @@ LAN while guests run on it.
   - *Live:* sync, then start a target QEMU on the home node on the parked disks, mirror only the
     blocks changed since that sync, migrate RAM back, and restore tags, onboot and HA.
   - *Cold:* shut down, final sync, optional full sha256 comparison, then start on the node.
+  - *To another node:* after the final sync, Proxmox's own offline `qm migrate` / `pct migrate`
+    moves the parked copy to the chosen node, and the return finishes there. Replication to that
+    node makes this quick.
   - If a live step fails, the guest keeps running where it was.
+- **Console.** The VM's QEMU VNC socket (password-protected, as on Proxmox) gets a fresh one-time
+  password per session. The browser runs noVNC, and the script bridges its WebSocket to that
+  socket itself, so websockify isn't needed.
+- **qcow2.** Cold copies and checksum checks read qcow2 images through Proxmox's own `qemu-nbd`
+  (read-only, on a private socket) with a small NBD client sent over SSH. Live moves mirror qcow2
+  disks in full; only raw disks get the pre-seed. Syncs write into qcow2 parked disks with
+  `qemu-img commit`.
 - **Long jobs** (move, sync, return) run as transient systemd units, so restarting the console
   never interrupts them. Moved VMs also run in their own units (`pportable-vm-<vmid>`).
 
@@ -133,6 +146,12 @@ To install them by hand instead:
 sudo apt-get install --no-install-recommends qemu-utils dnsmasq-base zstd python3 rsync nftables iptables lxc fuse3 openssl openssh-client iproute2 libaio1t64 libasound2t64 libcap-ng0 libcurl3t64-gnutls libepoxy0 libfdt1 libfuse3-4 libgbm1 libglib2.0-0t64 libgnutls30t64 libiscsi7 libjpeg62-turbo libnuma1 libpixman-1-0 libpng16-16t64 libpulse0 libseccomp2 libslirp0 libsndio7.0 libspice-server1 liburing2 libusb-1.0-0 libusbredirparser1t64 libvirglrenderer1 libxkbcommon0 libibverbs1 liblttng-ust1t64 librdmacm1t64 libnbd0 libcryptsetup12 libjson-glib-1.0-0
 ```
 
+**noVNC (for the web console).** `setup` runs `fetch-novnc`. It downloads Debian's `novnc`
+package with `apt-get download` and unpacks only its static files into
+`/opt/proxmox-portable/novnc` (1.6 MB). It does **not** install the package, so its dependencies
+(`nodejs`, `websockify`) are not needed; the WebSocket bridge is built into the script. It needs
+working apt sources. Debian 13 ships noVNC 1.6.0.
+
 From a node, `fetch-qemu` copies Proxmox's own packages, so the versions match your cluster:
 `pve-qemu-kvm`, `pve-edk2-firmware-ovmf`, `pve-edk2-firmware-legacy`, `swtpm`, `swtpm-libs`,
 `libtpms0`, `libproxmox-backup-qemu0`, `librados2`, `librbd1`. It unpacks them; it does not install
@@ -141,18 +160,20 @@ them as packages.
 ### The Proxmox cluster
 
 - **Proxmox VE 9.x** (tested on 9.2). 8.x is likely to work but is untested.
-- Guest disks on **raw** volumes: ZFS zvols, LVM / LVM-thin, or raw files. qcow2 is not supported.
+- Guest disks on **raw** volumes (ZFS zvols, LVM / LVM-thin, raw files) or **qcow2** images
+  (directory, NFS, CIFS storage). Other formats (vmdk, ...) are refused by the preflight check.
 - Root SSH from the portable host to every node (one key, see below).
 - An API token for the console (recommended), or none, in which case the console reads the cluster
   with `pvesh` over the same SSH connection (works, but each page loads in seconds, not
   milliseconds).
-- `python3`, `zstd`, `rsync` and `flock` on the nodes. A standard Proxmox install has all four.
+- `python3`, `zstd`, `rsync`, `flock` and `qemu-nbd` (part of `pve-qemu-kvm`) on the nodes. A
+  standard Proxmox install has all of them.
 
 ---
 
 ## What has been tested
 
-proxmox-portable **1.0.0**, 2026-11-08, against a 10-node cluster, from **two portable hosts**: an
+proxmox-portable **1.0.0** and **1.1.0**, 2026-11-08, against a 10-node cluster, from **two portable hosts**: an
 Intel laptop on wired Ethernet and an AMD laptop on Wi-Fi. Throwaway guests were created for the
 tests and destroyed afterwards. Each guest wrote checksummed files inside itself before and
 during the moves, and they were re-verified after every step.
@@ -202,8 +223,27 @@ during the moves, and they were re-verified after every step.
 | **Cold VM return to LVM-thin** with full sha256 verify | parked LVM volume identical to host B's copy; both USB entries unchanged in the Proxmox config; a file written on host B arrived |
 | Preflight on LVM-thin | counts only the allocated part (1.3 of 20 GiB) after the fix in this release |
 
-Not tested: thick (non-thin) LVM, Proxmox VE 8.x, other Debian versions on the portable host, and
-the node-upgrade use case below.
+**Added in 1.1.0** (host A, same cluster and versions, throwaway guests, checksummed data):
+
+| Test | Result |
+|---|---|
+| `fetch-novnc` | noVNC 1.6.0 unpacked from Debian's package; no extra packages installed |
+| **VNC console**, HTTP and HTTPS (`wss://`) | connected, showed the VM's screen; key presses reached the VM (`echo hi vnc` ran) |
+| Console security | needs a login (redirect / 401); WebSocket from a foreign `Origin` refused (403); `/novnc/../` path traversal blocked (404) |
+| **qcow2 cold move** (disk and cloud-init drive qcow2, on directory storage) | read through `qemu-nbd`, **257 MiB/s**, sha256 verified, booted here, data intact |
+| **qcow2 cold return** with sha256 verify | synced into the qcow2 parked disk; checksum identical; `qemu-img check` clean |
+| **qcow2 live move / return** (full mirror, no pre-seed) | **148 ms / 123 ms** downtime, data intact |
+| **Live VM return to a different node** (home node A → node B) | parked copy moved by `qm migrate` in 18 s, then **66 ms** downtime onto node B; data intact |
+| **Cold VM return to a different node** (home node B → node A) with verify | checksum taken on the moved disk: identical; started on node A |
+| **Container return to a different node** (home node A → node C) | two-pass sync, `pct migrate`, started on node C, data intact |
+| Return to a node lacking the guest's storage | refused **before** anything stopped, with a clear message |
+
+Not tested:
+- thick (non-thin) LVM
+- Proxmox VE 8.x
+- other Debian versions on the portable host
+- the console's "Type clipboard" button (it sends Shift for capitals and symbols on a US layout)
+- the node-upgrade use case below
 
 ---
 
@@ -261,6 +301,7 @@ This does the following:
 - adds `root:100000:65536` to `/etc/subuid` and `/etc/subgid`, which unprivileged containers need
 - generates the SSH key `/etc/proxmox-portable/id_pve`
 - writes and enables `proxmox-portable.service`
+- unpacks noVNC for the web console (`fetch-novnc`, see above)
 
 At the end it prints a public key line. Keep it for the next part.
 
@@ -287,7 +328,7 @@ own QEMU packages, if you have any, are not touched.
 sudo proxmox-portable check
 ```
 
-Every line should say `ok`: the config, `/dev/kvm`, the API, root SSH to each node, the QEMU
+Every line should say `ok`: the config, `/dev/kvm`, the API, root SSH to each node, noVNC, the QEMU
 bundle, the tools, and the LAN gateway and interface.
 
 ### 7. Start it
@@ -411,6 +452,7 @@ after editing.
 | | `nat_network` | `10.77.0.1/24` | this host's address on the NAT bridge; DHCP hands out the upper half |
 | `[paths]` | `data_dir` | `/var/lib/proxmox-portable` | guests' disks, job logs, graph samples |
 | | `qemu_bundle` | `/opt/proxmox-portable/pve-qemu` | where `fetch-qemu` unpacks Proxmox's QEMU |
+| | `novnc_dir` | `/opt/proxmox-portable/novnc` | where `fetch-novnc` unpacks noVNC for the console |
 | `[defaults]` | `shutdown_timeout` | `180` | seconds to wait for a clean shutdown before a cold return |
 | | `sync_interval` | `hourly` | default for new moves: `15min`, `30min`, `hourly`, `2h`, `6h`, `daily`, `off` |
 
@@ -432,7 +474,8 @@ The tree looks like Proxmox's. *Datacenter* lists the nodes and their guests, an
 | Watch a job | The job window opens by itself. Jobs are also in the bottom panel (*Portable jobs*) and in *Jobs* on the host and guest pages. |
 | **Sync now / change the schedule** | Guest on the host > *Sync & Backup* |
 | Start / stop a guest here | the toolbar on the guest's page |
-| **Return it** | Guest on the host > **Return to Proxmox**: live or cold, start on the node or not, sha256 verify (cold), delete the local copy or keep it |
+| **Open a VM's console** | Guest on the host > **Console**. It opens a window with the screen, Ctrl+Alt+Del, *Type clipboard* (types text as key presses, US layout), full screen and reconnect. |
+| **Return it** | Guest on the host > **Return to Proxmox**: live or cold, **which node** (home or another), start there or not, sha256 verify (cold), delete the local copy or keep it |
 | See replication/backups covering it | the guest's *Replication* / *Backup* tabs, or *Sync & Backup* |
 
 Scheduled syncs run while the `proxmox-portable` service runs. If the service is stopped, they
@@ -453,6 +496,7 @@ proxmox-portable sync 101               # start a sync job now
 proxmox-portable set-sync 101 30min     # 15min 30min hourly 2h 6h daily off
 proxmox-portable check                  # health check
 proxmox-portable fetch-qemu [NODE_IP]   # refresh the Proxmox QEMU bundle
+proxmox-portable fetch-novnc            # (re)unpack noVNC for the web console
 ```
 
 Moves and returns are started from the console.
@@ -507,8 +551,8 @@ portable host while you work on the node, then bring it back.
    upgraded node works. A live move needs this host's QEMU to be at least as new as the source's.
 
 Caveats:
-- It returns only to the node it came from. To use a different node, return it home, then use
-  Proxmox's Migrate.
+- Since 1.1.0 you can also return it to a different, already upgraded node instead (see
+  [Using it](#using-it)).
 - A major upgrade (for example 8 -> 9) changes much more than QEMU. Prefer a cold return there.
 - In LAN mode the host must stay on the guest's LAN for the whole time.
 
@@ -544,6 +588,8 @@ node bridges go to the NAT bridge.
   - POST requests need a custom header, which blocks cross-site requests.
   - After 5 failed logins from one address within 5 minutes, that address is refused for a while.
   - Strict security headers, including CSP and `X-Frame-Options`.
+  - The VNC console needs a logged-in session. Its WebSocket is accepted only from the console's
+    own origin. Each console session sets a new one-time VNC password on the VM.
 - **Exposure.** Serve it to your LAN only. Narrow it further with `allowed_networks`. Do not
   expose port 8006 to the internet.
 - **To keep the config file out of version control,** the repository's `.gitignore` already
@@ -553,7 +599,9 @@ node bridges go to the NAT bridge.
 
 ## Limits
 
-- Raw volumes only (ZFS, LVM-thin, LVM, raw files), not qcow2. Tested: ZFS and LVM-thin.
+- Volumes: raw (ZFS, LVM-thin, LVM, raw files) and qcow2. Tested: ZFS, LVM-thin, qcow2 on directory
+  storage. Live moves of qcow2 disks mirror the whole allocated disk (no pre-seed), so over a
+  slow link they take longer than raw ones.
 - **Live moves need:**
   - the VM running
   - no passthrough devices
@@ -571,9 +619,11 @@ node bridges go to the NAT bridge.
 - **Proxmox's own UI doesn't know about this.** Never start a `portable-*` tagged guest there.
   This console blocks that, and the portable host refuses to start or sync a guest whose Proxmox
   copy is running.
-- No VNC console in the web UI for guests on this host yet. QEMU's VNC socket is at
-  `/var/run/qemu-server/<vmid>.vnc`.
-- To end up on a different node: return the guest home first, then use Proxmox's own Migrate.
+- No console in the web UI for **containers** yet. Use `lxc-attach -n pve-<vmid>` on the portable
+  host.
+- **Returning to another node** needs the guest's storages on that node; the console checks this
+  before anything stops. Without replication, the parked disks are copied by `qm migrate` /
+  `pct migrate`, which takes as long as that copy.
 
 ---
 
@@ -594,6 +644,7 @@ node bridges go to the NAT bridge.
 | Graph samples (24 h) | `/var/lib/proxmox-portable/rrd/` |
 | LAN-mode DHCP log | `/var/log/proxmox-portable-dnsmasq.log` |
 | Proxmox QEMU bundle | `/opt/proxmox-portable/pve-qemu/` |
+| noVNC (console) | `/opt/proxmox-portable/novnc/` (Debian's copyright file is in `COPYRIGHT.debian`) |
 | Temporary sync files on a node | `/var/tmp/proxmox-portable/<vmid>/` |
 
 ---
@@ -685,12 +736,13 @@ newer, not yet released work.
 
 | Version | Date | What | Get it |
 |---|---|---|---|
+| **v1.1.0** | 2026-11-08 | VNC console for VMs on the portable host (noVNC unpacked from Debian, WebSocket bridge built in); qcow2 source volumes; return to a different node; target-storage check; faster qcow2 reads | [tag v1.1.0](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.1.0) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.1.0/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.1.0.tar.gz) |
 | **v1.0.0** | 2026-11-08 | First public release. Live/cold VM moves, container moves, sync, return; tested as described in [What has been tested](#what-has-been-tested) | [tag v1.0.0](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.0.0) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.0.0/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.0.0.tar.gz) |
 
-**Next: v1.1.0** (in development on `main`). Planned:
-- a VNC console for guests on the portable host
-- qcow2 source volumes
-- returning a guest straight to a different node
+**Next: v1.2.0** (in development on `main`). Planned:
+- a console for containers in the web UI
+- sparse-aware first copy for cold moves of raw volumes (today they read the zeros of thin disks)
+- a real test of the node-upgrade use case at the next Proxmox upgrade
 
 ---
 

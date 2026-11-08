@@ -2,6 +2,44 @@
 
 All notable changes to proxmox-portable. Newest first.
 
+## 1.1.0 - 2026-11-08 - released as tag `v1.1.0`
+
+### Added
+- **VNC console** for VMs running on the portable host: a *Console* button on the guest's toolbar
+  opens a window with the screen, Ctrl+Alt+Del, *Type clipboard* (US layout, Shift sent for
+  capitals/symbols), full screen and reconnect.
+  - noVNC 1.6 comes from Debian's `novnc` package via the new `fetch-novnc` (also run by `setup`):
+    `apt-get download` + `dpkg -x`, so its dependencies (`nodejs`, `websockify`) are not
+    installed.
+  - The WebSocket-to-VNC bridge is built into the script, stdlib only.
+  - Each session sets a one-time VNC password through QMP; the VM's VNC socket stays
+    password-protected, as Proxmox sets it.
+  - Security: a session is required, the WebSocket `Origin` must match the console host, the CSP
+    allows WebSockets only to that host, and static files are served path-checked.
+- **qcow2 source volumes** (directory/NFS/CIFS storage):
+  - Cold copies and the return checksum read the image through Proxmox's own `qemu-nbd`
+    (read-only, private socket) with a small pipelined NBD client sent over SSH.
+  - Live moves mirror qcow2 disks in full (no pre-seed).
+  - Syncs commit into qcow2 parked disks; EFI vars on qcow2 are written with
+    `qemu-img convert -n`.
+  - Sizes come from `qemu-img info -U` (virtual / actual size).
+- **Return to a different node**: *Return to node* in the return form. After the final sync,
+  Proxmox's offline `qm migrate` / `pct migrate` moves the parked copy, and the return (live or
+  cold, with verify) finishes there. The target's storages are checked before anything stops.
+- `novnc_dir` in `[paths]`; `check` reports noVNC.
+
+### Changed
+- When a qcow2 source runs here on raw/qcow2 files, the blockdev format node keeps only options
+  every format accepts.
+- Job logs name the target node, and the home node when they differ.
+
+### Tested
+See the README's "Added in 1.1.0" table:
+- console over HTTP and HTTPS
+- qcow2 cold 257 MiB/s and live 148/123 ms
+- return to another node: live (66 ms), cold with verify, and a container
+- the storage pre-check
+
 ## 1.0.0 - 2026-11-08 - released as tag `v1.0.0`
 
 The release is the initial commit (below) plus these changes from the same day:
