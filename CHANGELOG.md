@@ -2,6 +2,43 @@
 
 All notable changes to proxmox-portable. Newest first.
 
+## 1.2.0 - 2026-11-08 - released as tag `v1.2.0`
+
+### Added
+- **Container console**: the *Console* button now works for containers too. It opens an xterm.js
+  terminal bridged by the script to a PTY on the portable host. What it runs follows the
+  container's Proxmox console mode:
+  - `tty` (default): `lxc-console`, the container's login prompt
+  - `console`: `/dev/console`
+  - `shell`: `lxc-attach` with a clean environment, a root shell
+
+  Window resizes are passed on (`TIOCSWINSZ`). The PTY process is ended when the page closes or
+  the service restarts.
+- `fetch-console` (`fetch-novnc` still works) unpacks noVNC **and** xterm.js 5.3 from Debian's
+  `novnc` / `node-xterm` packages without installing them. `xterm_dir` is in `[paths]`, and
+  `check` reports xterm.js.
+
+### Changed
+- **Disk copies skip empty space and check faster.** A helper on the node reads the volume in
+  4 MiB chunks:
+  - all-zero chunks travel as a 5-byte marker instead of 4 MiB
+  - the checksum is sha256 over the per-chunk sha256 sums, on 4 threads on both ends (one
+    `sha256sum` was the bottleneck)
+  - the same format serves cold copies, the live pre-seed, qcow2 (via the NBD reader) and the
+    checksum check on a cold return
+
+  Measured on a 20 GiB thin ZFS volume holding 1.4 GiB:
+  - cold copy and pre-seed: 2 min 7 s -> 37 s
+  - cold-return check: about 95 s -> 25 s
+
+  ZFS volumes don't report holes (`SEEK_DATA` fails; `qemu-img map` says all data), so empty
+  space is detected by content.
+- The WebSocket code is shared by the VM and container consoles.
+
+### Not done
+- The node-upgrade use case is still untested: the test cluster had no newer `pve-qemu-kvm`
+  to upgrade to.
+
 ## 1.1.0 - 2026-11-08 - released as tag `v1.1.0`
 
 ### Added

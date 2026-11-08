@@ -16,7 +16,8 @@ Usage:  proxmox-portable [--config FILE] COMMAND [ARGS]
   serve                     web console + scheduler (what the systemd unit runs)
   setup                     install Debian packages, directories, SSH key, systemd unit
   fetch-qemu [NODE_IP]      copy Proxmox's QEMU/swtpm/OVMF from a node into the bundle
-  fetch-novnc               unpack Debian's noVNC files (web VNC console) without installing the package
+  fetch-console             unpack Debian's noVNC and xterm.js files (web consoles) without installing
+                            the packages (fetch-novnc is the old name)
   check                     check config, cluster access, SSH and the QEMU bundle
   hash-password             print a password_hash line for the config file
   status | list | vm-status ID | jobs | job ID | history [ID]
@@ -51,7 +52,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_CONF = "/etc/proxmox-portable/proxmox-portable.conf"
 SELF = os.path.realpath(__file__)
 QRUN = "/var/run/qemu-server"          # Proxmox's command lines expect their sockets here
@@ -126,6 +127,7 @@ def load_config(path):
     C.data = g("paths", "data_dir", "/var/lib/proxmox-portable")
     C.pveq = g("paths", "qemu_bundle", "/opt/proxmox-portable/pve-qemu")
     C.novnc = g("paths", "novnc_dir", "/opt/proxmox-portable/novnc")
+    C.xterm = g("paths", "xterm_dir", "/opt/proxmox-portable/xterm")
     # [defaults]
     C.shutdown_timeout = int(g("defaults", "shutdown_timeout", "180"))
     C.sync_default = g("defaults", "sync_interval", "hourly")
@@ -627,7 +629,7 @@ def cmd_host_status(args=None):
         "ifaces": iface_addrs(), "default_iface": default_iface(), "lan_iface": lan_iface(),
         "bridge": C.bridge, "nat_bridge": C.nat_bridge, "nat_network": str(C.nat_net.network),
         "tailscale": run(["tailscale", "ip", "-4"], check=False).strip() if shutil.which("tailscale") else "",
-        "battery": battery(), "guests": list_guests(), "novnc": os.path.exists(C.novnc + "/core/rfb.js"),
+        "battery": battery(), "guests": list_guests(), "novnc": os.path.exists(C.novnc + "/core/rfb.js"), "xterm": os.path.exists(C.xterm + "/xterm/lib/xterm.js"),
     }
 
 
@@ -1338,6 +1340,82 @@ finally:
 SUPPORTED_FORMATS = ("raw", "qcow2")
 
 
+# Chunk stream (node side). Reads a volume in 4 MiB chunks: all-zero chunks become a 5-byte marker
+# instead of 4 MiB of data, and the checksum is sha256 over the per-chunk sha256 digests, computed on
+# several threads (a single sha256sum was the bottleneck: ~280 MB/s). "stream" writes
+# D<len><data> / Z<len> records and E<total><digest>; "hash" prints only "<hex digest> <total>".
+PVE_CHUNKS_PY = r'''
+import collections,hashlib,struct,sys
+from concurrent.futures import ThreadPoolExecutor
+mode,path=sys.argv[1],sys.argv[2]
+CH=4<<20;Z=bytes(CH);ZH={}
+inp=sys.stdin.buffer.raw if path=="-" else open(path,"rb",buffering=0)
+out=sys.stdout.buffer
+pool=ThreadPoolExecutor(4);digs=[];pend=collections.deque();total=0
+H=lambda b: hashlib.sha256(b).digest()
+buf=bytearray(CH);mv=memoryview(buf)
+def full():
+    n=0
+    while n<CH:
+        r=inp.readinto(mv[n:])
+        if not r: break
+        n+=r
+    return n
+while True:
+    n=full()
+    if not n: break
+    total+=n
+    if (buf if n==CH else mv[:n])==Z[:n]:
+        if n not in ZH: ZH[n]=H(Z[:n])
+        digs.append(ZH[n])
+        if mode=="stream": out.write(b"Z"+struct.pack("!I",n))
+    else:
+        b=bytes(mv[:n])
+        digs.append(pool.submit(H,b));pend.append(len(digs)-1)
+        if mode=="stream": out.write(b"D"+struct.pack("!I",n));out.write(b)
+        while len(pend)>16:
+            i=pend.popleft();digs[i]=digs[i].result()
+final=hashlib.sha256(b"".join(d if isinstance(d,bytes) else d.result() for d in digs)).digest()
+if mode=="stream": out.write(b"E"+struct.pack("!Q",total)+final)
+else: print(final.hex(),total)
+out.flush()
+'''
+
+
+def chunk_digest_file(path):
+    """The same chunked checksum as PVE_CHUNKS_PY, for a local file. Returns (hex, size)."""
+    import collections
+    from concurrent.futures import ThreadPoolExecutor
+    CH = 4 << 20
+    zero = bytes(CH)
+    zh, digs, pend, total = {}, [], collections.deque(), 0
+    with open(path, "rb", buffering=0) as f, ThreadPoolExecutor(4) as pool:
+        while True:
+            b = f.read(CH)
+            if not b:
+                break
+            n = len(b)
+            total += n
+            if b == zero[:n]:
+                digs.append(zh.setdefault(n, hashlib.sha256(zero[:n]).digest()))
+            else:
+                digs.append(pool.submit(lambda x: hashlib.sha256(x).digest(), b))
+                pend.append(len(digs) - 1)
+                while len(pend) > 16:
+                    i = pend.popleft()
+                    digs[i] = digs[i].result()
+        final = hashlib.sha256(b"".join(d if isinstance(d, bytes) else d.result() for d in digs)).hexdigest()
+    return final, total
+
+
+def remote_chunks(path, fmt, mode):
+    """Shell command (run on a node, in bash) for the chunk stream or checksum of a volume."""
+    py = "python3 -c %s %s" % (shlex.quote(PVE_CHUNKS_PY), mode)
+    if fmt == "raw":
+        return "%s %s" % (py, shlex.quote(path))
+    return "set -o pipefail; %s | %s -" % (remote_reader(path, fmt), py)
+
+
 def remote_reader(path, fmt):
     """Shell command (run on a node) that writes a volume's guest-visible contents to stdout."""
     if fmt == "raw":
@@ -1346,48 +1424,74 @@ def remote_reader(path, fmt):
 
 
 def stream_volume(m, dk, log, jid, label):
-    """Copy one Proxmox volume to a sparse local raw file, sha256-verified on both ends."""
+    """Copy one Proxmox volume to a sparse local raw file. Zero chunks are not sent at all; the data is
+    checked with the chunked sha256 computed on both ends."""
+    import collections
+    from concurrent.futures import ThreadPoolExecutor
     ip = m["origin_ip"]
     path, size = dk["pve_path"], dk["size"]
     dst = vmdir(m["vmid"]) + "/" + dk["base"]
     log("copying %s (%s, %.2f GiB) from %s:%s" % (dk["key"], dk["volid"], size / 2**30, m["origin_node"], path))
-    remote = ("set -o pipefail; f=$(mktemp); %s | tee >(sha256sum | cut -c1-64 > $f) "
-              "| zstd -1 -T2 -q; rc=$?; sleep 1; echo \"PPSHA $(cat $f)\" >&2; rm -f $f; exit $rc") % remote_reader(path, dk.get("pve_format", "raw"))
+    remote = "set -o pipefail; { %s; } | zstd -1 -T2 -q" % remote_chunks(path, dk.get("pve_format", "raw"), "stream")
     ssh = subprocess.Popen(pve_ssh_cmd(ip) + ["bash -c " + shlex.quote(remote)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    unz = subprocess.Popen(["zstd", "-d", "-q", "-c"], stdin=ssh.stdout, stdout=subprocess.PIPE)
+    unz = subprocess.Popen(["zstd", "-d", "-q", "-c"], stdin=ssh.stdout, stdout=subprocess.PIPE, bufsize=1 << 20)
     ssh.stdout.close()
-    h = hashlib.sha256()
-    CH = 4 << 20
-    zero = bytes(CH)
-    done, t0, last = 0, time.time(), 0
-    with open(dst, "wb") as f:
-        f.truncate(size)
-        while True:
-            buf = unz.stdout.read(CH)
-            if not buf:
-                break
-            h.update(buf)
-            if buf == zero[:len(buf)]:
-                f.seek(len(buf), 1)
-            else:
-                f.write(buf)
-            done += len(buf)
-            if time.time() - last > 3:
-                last = time.time()
-                job_progress(jid, step=label, done=done, total=size, rate=done / max(1, time.time() - t0))
-        f.flush()
-        os.fsync(f.fileno())
-    unz.wait()
-    err = ssh.stderr.read().decode(errors="replace")
-    ssh.wait()
-    if ssh.returncode or unz.returncode:
+    rd = unz.stdout
+    zero = bytes(4 << 20)
+    zh, digs, pend = {}, [], collections.deque()
+    done, sent, t0, last, end_rec = 0, 0, time.time(), 0, None
+
+    def need(n):
+        b = rd.read(n)
+        if len(b) != n:
+            raise RuntimeError("copy of %s: stream ended early at %d bytes" % (dk["key"], done))
+        return b
+    try:
+        with open(dst, "wb") as f, ThreadPoolExecutor(4) as pool:
+            f.truncate(size)
+            while True:
+                t = rd.read(1)
+                if t == b"D":
+                    n = struct.unpack("!I", need(4))[0]
+                    b = need(n)
+                    f.seek(done)
+                    f.write(b)
+                    digs.append(pool.submit(lambda x: hashlib.sha256(x).digest(), b))
+                    pend.append(len(digs) - 1)
+                    while len(pend) > 16:
+                        i = pend.popleft()
+                        digs[i] = digs[i].result()
+                    done += n
+                    sent += n
+                elif t == b"Z":
+                    n = struct.unpack("!I", need(4))[0]
+                    digs.append(zh.setdefault(n, hashlib.sha256(zero[:n]).digest()))
+                    done += n
+                elif t == b"E":
+                    end_rec = struct.unpack("!Q", need(8))[0], need(32)
+                    break
+                else:
+                    break
+                if time.time() - last > 3:
+                    last = time.time()
+                    job_progress(jid, step=label, done=done, total=size, rate=done / max(1, time.time() - t0))
+            final = hashlib.sha256(b"".join(d if isinstance(d, bytes) else d.result() for d in digs)).digest()
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        rd.close()
+        unz.wait()
+        err = ssh.stderr.read().decode(errors="replace")
+        ssh.wait()
+    if ssh.returncode or unz.returncode or not end_rec:
         raise RuntimeError("copy of %s failed (ssh rc %s, zstd rc %s): %s" % (dk["key"], ssh.returncode, unz.returncode, err[-500:]))
-    rsha = (re.findall(r"PPSHA ([0-9a-f]{64})", err) or [""])[0]
-    if done != size:
+    if done != size or end_rec[0] != size:
         raise RuntimeError("copy of %s: got %d bytes, expected %d" % (dk["key"], done, size))
-    if rsha != h.hexdigest():
+    if end_rec[1] != final:
         raise RuntimeError("checksum mismatch on %s" % dk["key"])
-    log("  %s copied, %.1f MiB/s, sha256 %s verified" % (dk["key"], size / 2**20 / max(1, time.time() - t0), rsha[:16]))
+    secs = max(0.1, time.time() - t0)
+    log("  %s copied in %.0fs (%.1f MiB/s; %.2f GiB of data, the rest empty), checksum %s verified"
+        % (dk["key"], secs, size / 2**20 / secs, sent / 2**30, final.hex()[:16]))
 
 
 def volume_info(ip, volid):
@@ -2115,12 +2219,11 @@ def relocate_parked(m, target, log, jid):
 def verify(m, log, jid):
     for dk in [x for x in m["disks"] if x["kind"] == "disk"]:
         job_progress(jid, step="verify " + dk["key"], done=0, total=dk["size"])
-        log("verifying %s: sha256 of the local copy vs %s" % (dk["key"], dk["pve_path"]))
-        rp = subprocess.Popen(pve_ssh_cmd(m["origin_ip"]) + ["set -o pipefail; %s | sha256sum | cut -c1-64" % remote_reader(
-                              dk["pve_path"], dk.get("pve_format", "raw"))],
-                              stdout=subprocess.PIPE, text=True)
-        lsha = sha_file(vmdir(m["vmid"]) + "/" + dk["base"])
-        rsha = rp.communicate()[0].strip()
+        log("verifying %s: chunked sha256 of the local copy vs %s" % (dk["key"], dk["pve_path"]))
+        rp = subprocess.Popen(pve_ssh_cmd(m["origin_ip"]) + ["bash -c " + shlex.quote(remote_chunks(
+                              dk["pve_path"], dk.get("pve_format", "raw"), "hash"))], stdout=subprocess.PIPE, text=True)
+        lsha = chunk_digest_file(vmdir(m["vmid"]) + "/" + dk["base"])[0]
+        rsha = (rp.communicate()[0].split() or [""])[0]
         if lsha != rsha:
             raise RuntimeError("verify failed on %s: local %s, Proxmox %s" % (dk["key"], lsha[:16], rsha[:16]))
         log("  %s identical (%s)" % (dk["key"], lsha[:16]))
@@ -2840,9 +2943,9 @@ WantedBy=multi-user.target
     with open("/etc/systemd/system/proxmox-portable.service", "w") as f:
         f.write(unit)
     try:
-        cmd_fetch_novnc([])
+        cmd_fetch_console([])
     except Exception as e:
-        print("WARNING: noVNC not unpacked (%s); the web console needs it: run `fetch-novnc` later" % e)
+        print("WARNING: console files not unpacked (%s); the web consoles need them: run `fetch-console` later" % e)
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "proxmox-portable.service"])
     print("\nsetup done.\n\nAdd this public key to the cluster (on ANY Proxmox node, as root):\n")
@@ -2916,30 +3019,43 @@ def cmd_fetch_qemu(args):
     return None
 
 
-def cmd_fetch_novnc(args):
-    """Unpack Debian's noVNC (static JS) into novnc_dir. Only its files are used, so the package's
-    dependencies (nodejs, websockify) are not needed: the WebSocket bridge is built into this script."""
-    need_root()
-    tmp = run(["mktemp", "-d", "/tmp/proxmox-portable-novnc.XXXXXX"]).strip()
+def unpack_deb(pkg, parts, dest, marker):
+    """apt-get download PKG and copy only some of its directories (parts: {src path in the .deb: name under
+    dest}) into dest. The package is not installed, so its dependencies are not pulled in."""
+    tmp = run(["mktemp", "-d", "/tmp/proxmox-portable-deb.XXXXXX"]).strip()
     try:
-        subprocess.run(["apt-get", "download", "novnc"], cwd=tmp, check=True, capture_output=True)
-        deb = [f for f in os.listdir(tmp) if f.startswith("novnc_") and f.endswith(".deb")]
+        subprocess.run(["apt-get", "download", pkg], cwd=tmp, check=True, capture_output=True)
+        deb = [f for f in os.listdir(tmp) if f.startswith(pkg + "_") and f.endswith(".deb")]
         if not deb:
-            raise UserError("apt-get download novnc gave no package")
+            raise UserError("apt-get download %s gave no package" % pkg)
         run(["dpkg", "-x", tmp + "/" + deb[0], tmp + "/x"])
-        src = tmp + "/x/usr/share/novnc"
-        if not os.path.exists(src + "/core/rfb.js"):
-            raise UserError("the novnc package has no core/rfb.js")
-        shutil.rmtree(C.novnc + ".new", ignore_errors=True)
-        shutil.copytree(src, C.novnc + ".new", symlinks=True)
-        cp = tmp + "/x/usr/share/doc/novnc/copyright"
+        new = dest + ".new"
+        shutil.rmtree(new, ignore_errors=True)
+        os.makedirs(new)
+        for src, name in parts.items():
+            if not os.path.isdir(tmp + "/x" + src):
+                raise UserError("package %s has no %s" % (pkg, src))
+            shutil.copytree(tmp + "/x" + src, new + "/" + name if name else new, symlinks=True, dirs_exist_ok=True)
+        cp = tmp + "/x/usr/share/doc/%s/copyright" % pkg
         if os.path.exists(cp):
-            shutil.copy(cp, C.novnc + ".new/COPYRIGHT.debian")
-        shutil.rmtree(C.novnc, ignore_errors=True)
-        os.rename(C.novnc + ".new", C.novnc)
-        print("noVNC %s unpacked to %s" % (urllib.parse.unquote(deb[0].split("_")[1]), C.novnc))
+            shutil.copy(cp, new + "/COPYRIGHT.debian")
+        if not os.path.exists(new + "/" + marker):
+            raise UserError("package %s: %s missing after unpacking" % (pkg, marker))
+        shutil.rmtree(dest, ignore_errors=True)
+        os.rename(new, dest)
+        print("%s %s unpacked to %s" % (pkg, urllib.parse.unquote(deb[0].split("_")[1]), dest))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_fetch_console(args):
+    """Static files for the web consoles, from Debian's packages without installing them:
+    noVNC (VMs; its deps nodejs/websockify are not needed, the WebSocket bridge is built in) and
+    xterm.js (containers; node-xterm only suggests nodejs)."""
+    need_root()
+    unpack_deb("novnc", {"/usr/share/novnc": ""}, C.novnc, "core/rfb.js")
+    unpack_deb("node-xterm", {"/usr/share/nodejs/xterm": "xterm", "/usr/share/nodejs/xterm-addon-fit": "xterm-addon-fit"},
+               C.xterm, "xterm/lib/xterm.js")
     return None
 
 
@@ -2971,8 +3087,10 @@ def cmd_check(args):
             line(False, "root SSH to %s (%s)" % (n["name"], n.get("ip")), str(e)[-200:])
     line(os.path.exists(C.kvm), "Proxmox QEMU bundle " + C.pveq,
          (run([C.kvm, "--version"], check=False).splitlines() or [""])[0] if os.path.exists(C.kvm) else "run fetch-qemu")
-    line(os.path.exists(C.novnc + "/core/rfb.js"), "noVNC for the web console " + C.novnc,
-         "" if os.path.exists(C.novnc + "/core/rfb.js") else "run fetch-novnc")
+    line(os.path.exists(C.novnc + "/core/rfb.js"), "noVNC for the VM console " + C.novnc,
+         "" if os.path.exists(C.novnc + "/core/rfb.js") else "run fetch-console")
+    line(os.path.exists(C.xterm + "/xterm/lib/xterm.js"), "xterm.js for the container console " + C.xterm,
+         "" if os.path.exists(C.xterm + "/xterm/lib/xterm.js") else "run fetch-console")
     for t in ("lxc-start", "rsync", "zstd", "qemu-img", "dnsmasq", "nft", "ssh"):
         line(bool(shutil.which(t)), "tool " + t)
     gw = host_gateway()
@@ -3326,18 +3444,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, APP_JS, "application/javascript; charset=utf-8")
         if u.path == "/app.css":
             return self.send(200, APP_CSS, "text/css; charset=utf-8")
-        if u.path in ("/console", "/console.js", "/vncws") or u.path.startswith("/novnc/"):
+        if u.path in ("/console", "/console.js", "/vncws", "/tconsole", "/tconsole.js", "/termws") or \
+                u.path.startswith(("/novnc/", "/xterm/")):
             if not self.session():
-                if u.path == "/console":
+                if u.path in ("/console", "/tconsole"):
                     return self.send(302, "", "text/plain", {"Location": "/"})
                 return self.send(401, "login required\n", "text/plain")
-            if u.path == "/console":
-                return self.send(200, CONSOLE_HTML, "text/html; charset=utf-8")
-            if u.path == "/console.js":
-                return self.send(200, CONSOLE_JS, "application/javascript; charset=utf-8")
+            pages = {"/console": (CONSOLE_HTML, "text/html; charset=utf-8"), "/console.js": (CONSOLE_JS, "application/javascript; charset=utf-8"),
+                     "/tconsole": (TCONSOLE_HTML, "text/html; charset=utf-8"), "/tconsole.js": (TCONSOLE_JS, "application/javascript; charset=utf-8")}
+            if u.path in pages:
+                return self.send(200, *pages[u.path])
             if u.path == "/vncws":
                 return self.ws_vnc(u)
-            return self.static_novnc(u.path[len("/novnc/"):])
+            if u.path == "/termws":
+                return self.ws_term(u)
+            if u.path.startswith("/xterm/"):
+                return self.static_dir(C.xterm, u.path[len("/xterm/"):])
+            return self.static_dir(C.novnc, u.path[len("/novnc/"):])
         if u.path != "/api":
             return self.send(404, "not found\n", "text/plain")
         q = {k: v[-1] for k, v in urllib.parse.parse_qs(u.query).items()}
@@ -3379,8 +3502,8 @@ class Handler(BaseHTTPRequestHandler):
             ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
             ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf", ".oga": "audio/ogg", ".mp3": "audio/mpeg"}
 
-    def static_novnc(self, rel):
-        base = os.path.realpath(C.novnc)
+    def static_dir(self, base, rel):
+        base = os.path.realpath(base)
         path = os.path.realpath(os.path.join(base, urllib.parse.unquote(rel)))
         if not path.startswith(base + "/") or not os.path.isfile(path):
             return self.send(404, "not found\n", "text/plain")
@@ -3389,52 +3512,48 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, f.read(), self.MIME.get(ext, "application/octet-stream"),
                              {"Cache-Control": "max-age=3600"})
 
-    def ws_vnc(self, u):
-        """WebSocket <-> the VM's VNC unix socket (what websockify does, built in)."""
-        q = urllib.parse.parse_qs(u.query)
+    def ws_vmid(self, u):
         try:
-            vmid = int((q.get("vmid") or ["0"])[0])
+            return int((urllib.parse.parse_qs(u.query).get("vmid") or ["0"])[0])
         except ValueError:
-            vmid = 0
-        origin = self.headers.get("Origin", "")
-        host = self.headers.get("Host", "")
+            return 0
+
+    def ws_check(self):
+        """Refuse WebSocket upgrades from another origin or without the handshake headers."""
+        origin, host = self.headers.get("Origin", ""), self.headers.get("Host", "")
         if not origin or urllib.parse.urlsplit(origin).netloc != host:
-            return self.send(403, "bad origin\n", "text/plain")
+            self.send(403, "bad origin\n", "text/plain")
+            return False
+        if self.headers.get("Upgrade", "").lower() != "websocket" or not self.headers.get("Sec-WebSocket-Key"):
+            self.send(400, "websocket expected\n", "text/plain")
+            return False
+        return True
+
+    def ws_accept(self):
+        """Finish the WebSocket handshake. Returns send(opcode, bytes) and a generator of (opcode, bytes)."""
         key = self.headers.get("Sec-WebSocket-Key")
-        if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
-            return self.send(400, "websocket expected\n", "text/plain")
-        m = load_json(vmdir(vmid) + "/meta.json") if vmid else None
-        vsock = "%s/%d.vnc" % (QRUN, vmid)
-        if not m or m.get("kind") != "qemu" or not vm_pid(vmid) or not os.path.exists(vsock):
-            return self.send(404, "no running VM %d here\n" % vmid, "text/plain")
-        try:
-            vnc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            vnc.connect(vsock)
-        except OSError as e:
-            return self.send(502, "VNC: %s\n" % e, "text/plain")
         acc = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
         hdr = ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", "Sec-WebSocket-Accept: " + acc]
-        protos = [x.strip() for x in self.headers.get("Sec-WebSocket-Protocol", "").split(",") if x.strip()]
-        if "binary" in protos:
+        if "binary" in [x.strip() for x in self.headers.get("Sec-WebSocket-Protocol", "").split(",")]:
             hdr.append("Sec-WebSocket-Protocol: binary")
         self.wfile.write(("\r\n".join(hdr) + "\r\n\r\n").encode())
         self.close_connection = True
         lock = threading.Lock()
 
-        def send_frame(op, data):
+        def send(op, data):
             n = len(data)
             head = bytes([0x80 | op]) + (bytes([n]) if n < 126 else
                                            struct.pack("!BH", 126, n) if n < 65536 else struct.pack("!BQ", 127, n))
             with lock:
                 self.wfile.write(head + data)
 
-        def from_browser():
+        def frames():
             rf = self.rfile
             try:
                 while True:
                     h = rf.read(2)
                     if len(h) < 2:
-                        break
+                        return
                     op, n = h[0] & 0x0F, h[1] & 0x7F
                     if n == 126:
                         n = struct.unpack("!H", rf.read(2))[0]
@@ -3446,36 +3565,139 @@ class Handler(BaseHTTPRequestHandler):
                         data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
                     if op == 8:
                         try:
-                            send_frame(8, data[:2])
+                            send(8, data[:2])
                         except OSError:
                             pass
-                        break
+                        return
                     if op == 9:
-                        send_frame(10, data)
+                        send(10, data)
                     elif op in (0, 1, 2):
-                        vnc.sendall(data)
+                        yield op, data
             except (OSError, ValueError, struct.error):
+                return
+        return send, frames
+
+    def ws_vnc(self, u):
+        """WebSocket <-> the VM's VNC unix socket (what websockify does, built in)."""
+        if not self.ws_check():
+            return
+        vmid = self.ws_vmid(u)
+        m = load_json(vmdir(vmid) + "/meta.json") if vmid else None
+        vsock = "%s/%d.vnc" % (QRUN, vmid)
+        if not m or m.get("kind") != "qemu" or not vm_pid(vmid) or not os.path.exists(vsock):
+            return self.send(404, "no running VM %d here\n" % vmid, "text/plain")
+        try:
+            vnc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            vnc.connect(vsock)
+        except OSError as e:
+            return self.send(502, "VNC: %s\n" % e, "text/plain")
+        send, frames = self.ws_accept()
+
+        def from_browser():
+            try:
+                for op, data in frames():
+                    vnc.sendall(data)
+            except OSError:
                 pass
             finally:
                 try:
                     vnc.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-
-        t = threading.Thread(target=from_browser, daemon=True)
-        t.start()
+        threading.Thread(target=from_browser, daemon=True).start()
         try:
             while True:
                 d = vnc.recv(65536)
                 if not d:
                     break
-                send_frame(2, d)
+                send(2, d)
         except OSError:
             pass
         finally:
             vnc.close()
             try:
-                send_frame(8, struct.pack("!H", 1000))
+                send(8, struct.pack("!H", 1000))
+            except OSError:
+                pass
+
+    def ws_term(self, u):
+        """WebSocket <-> a terminal (PTY) attached to a container running here. The command follows the
+        container's Proxmox console mode: tty (default: its login prompt), console (/dev/console) or
+        shell (a root shell via lxc-attach). Browser messages: "0<input>" or "1<cols>:<rows>"."""
+        import pty
+        import select
+        import signal
+        import termios
+        if not self.ws_check():
+            return
+        vmid = self.ws_vmid(u)
+        m = load_json(vmdir(vmid) + "/meta.json") if vmid else None
+        if not m or m.get("kind") != "lxc" or m.get("state") not in ("on-host", "returning") or ct_state(m) != "running":
+            return self.send(404, "no running container %d here\n" % vmid, "text/plain")
+        name = ct_name(m)
+        cmode = (m.get("pve_config") or {}).get("cmode", "tty")
+        if cmode == "shell":
+            # a clean environment, like `pct enter`: the host's locale and variables don't leak in
+            cmd = ["lxc-attach", "-n", name, "--clear-env", "--set-var", "TERM=xterm-256color", "--set-var", "HOME=/root",
+                   "--set-var", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "--",
+                   "/bin/sh", "-c", "cd /root 2>/dev/null; command -v bash >/dev/null && exec bash -l || exec sh -l"]
+        elif cmode == "console":
+            cmd = ["lxc-console", "-n", name, "-t", "0", "-e", "-1"]
+        else:
+            cmd = ["lxc-console", "-n", name, "-e", "-1"]
+        send, frames = self.ws_accept()
+        pid, fd = pty.fork()
+        if pid == 0:     # child: becomes the terminal's process
+            os.environ["TERM"] = "xterm-256color"
+            try:
+                os.execvp(cmd[0], cmd)
+            finally:
+                os._exit(127)
+
+        def from_browser():
+            try:
+                for op, data in frames():
+                    if data[:1] == b"0":
+                        os.write(fd, data[1:])
+                    elif data[:1] == b"1":
+                        try:
+                            cols, rows = (int(x) for x in data[1:].decode().split(":"))
+                            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                        except (ValueError, OSError):
+                            pass
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.kill(pid, signal.SIGHUP)
+                except OSError:
+                    pass
+        threading.Thread(target=from_browser, daemon=True).start()
+        try:
+            while True:
+                r, _, _ = select.select([fd], [], [], 1.0)
+                if r:
+                    d = os.read(fd, 65536)
+                    if not d:
+                        break
+                    send(2, d)
+                elif os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+        except OSError:
+            pass
+        finally:
+            for sig in (signal.SIGHUP, signal.SIGKILL):
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            os.close(fd)
+            try:
+                send(8, struct.pack("!H", 1000))
             except OSError:
                 pass
 
@@ -3579,7 +3801,7 @@ def main():
             print("error: %s" % e, file=sys.stderr)
             sys.exit(2)
     table = {
-        "serve": cmd_serve, "setup": cmd_setup, "fetch-qemu": cmd_fetch_qemu, "fetch-novnc": cmd_fetch_novnc, "check": cmd_check,
+        "serve": cmd_serve, "setup": cmd_setup, "fetch-qemu": cmd_fetch_qemu, "fetch-console": cmd_fetch_console, "fetch-novnc": cmd_fetch_console, "check": cmd_check,
         "hash-password": cmd_hash_password,
         "status": cmd_host_status, "list": cmd_list, "vm-status": cmd_vm_status, "jobs": cmd_jobs, "job": cmd_job,
         "history": cmd_history,
@@ -3827,6 +4049,7 @@ body.console { display: flex; flex-direction: column; height: 100vh; grid-templa
 #cbar .mark { background: var(--orange); color: #fff; font-weight: 700; padding: 1px 5px; border-radius: 2px; }
 #cbar .cr { margin-left: auto; display: flex; gap: 5px; }
 #screen { flex: 1; min-height: 0; overflow: hidden; }
+#screen.term { padding: 4px; background: #000; }
 th.kcol { width: 180px; }
 .prewrap { white-space: pre-wrap; }
 .cin { padding: 4px; border: 1px solid var(--btn-b); background: var(--panel); }
@@ -4050,7 +4273,8 @@ function renderToolbar(k, n) {
       <button class="btn" data-lp="shutdown" ${!run ? 'disabled' : ''}>⏻ Shutdown</button>
       <button class="btn danger" data-lp="stop" ${!run ? 'disabled' : ''}>■ Stop</button>
       <button class="btn" data-lp="reboot" ${!run ? 'disabled' : ''}>↻ Reboot</button>
-      ${g.kind === 'lxc' ? '' : `<button class="btn" data-console="${g.vmid}" ${!run || !(S.tree.host || {}).novnc ? 'disabled' : ''} title="${(S.tree.host || {}).novnc ? 'Open the VNC console' : 'noVNC missing: run fetch-novnc'}">🖥 Console</button>`}
+      ${(() => { const H = S.tree.host || {}; const have = g.kind === 'lxc' ? H.xterm : H.novnc;
+        return `<button class="btn" data-console="${g.vmid}" data-ct="${g.kind === 'lxc' ? 1 : ''}" ${!run || !have ? 'disabled' : ''} title="${have ? 'Open the console' : 'console files missing: run fetch-console'}">🖥 Console</button>`; })()}
       <button class="btn" data-sync="1" ${!ok ? 'disabled' : ''}>⇅ Sync now</button>
       <button class="btn primary" data-tosub="return" ${!ok ? 'disabled' : ''}>⤺ Return to Proxmox</button>`;
   }
@@ -4061,7 +4285,7 @@ $('#toolbar').addEventListener('click', async e => {
   const n = flatFind(S.sel); if (!n) return;
   if (b.dataset.tosub) { S.sub = b.dataset.tosub; renderView(true); return; }
   if (b.dataset.goto) { select(b.dataset.goto); return; }
-  if (b.dataset.console) { window.open('console?vmid=' + b.dataset.console, 'pp-console-' + b.dataset.console, 'width=1060,height=860'); return; }
+  if (b.dataset.console) { window.open((b.dataset.ct ? 'tconsole' : 'console') + '?vmid=' + b.dataset.console, 'pp-console-' + b.dataset.console, 'width=1060,height=760'); return; }
   if (b.dataset.pv) {
     const act = b.dataset.pv, g = n.data;
     if (act !== 'start' && !await confirmTyped(`${act} ${g.type === 'lxc' ? 'CT' : 'VM'} ${g.vmid} (${g.name}) on ${g.node}?`, act === 'stop' ? String(g.vmid) : null)) return;
@@ -4630,6 +4854,60 @@ $('#paste').onclick = async () => {
   }
   rfb.focus();
 };
+connect();
+"""
+
+
+TCONSOLE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1 15 4.5v7L8 15 1 11.5v-7z' fill='%235aa469'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css?v=""" + VERSION + r"""">
+<link rel="stylesheet" href="xterm/xterm/css/xterm.css">
+</head>
+<body class="console">
+<div id="cbar"><span class="mark">PP</span> <b id="cname">Container console</b> <span id="st" class="muted">connecting…</span>
+<span class="cr"><button class="btn" id="fs" title="Full screen">⛶</button> <button class="btn" id="re" title="Reconnect">⟳</button></span></div>
+<div id="screen" class="term"></div>
+<script src="xterm/xterm/lib/xterm.js"></script>
+<script src="xterm/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+<script src="tconsole.js?v=""" + VERSION + r""""></script>
+</body>
+</html>
+"""
+
+TCONSOLE_JS = r"""// proxmox-portable: terminal console for a container running on this host (xterm.js).
+'use strict';
+const $ = s => document.querySelector(s);
+const vmid = new URLSearchParams(location.search).get('vmid');
+document.title = 'CT ' + vmid + ' - Console';
+$('#cname').textContent = 'CT ' + vmid;
+const term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000,
+  fontFamily: '"DejaVu Sans Mono", Menlo, Consolas, monospace' });
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open($('#screen'));
+let ws = null;
+function resize() {
+  try { fit.fit(); } catch (e) {}
+  if (ws && ws.readyState === 1) ws.send('1' + term.cols + ':' + term.rows);
+}
+function connect() {
+  if (ws) { try { ws.close(); } catch (e) {} }
+  $('#st').textContent = 'connecting…';
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/termws?vmid=' + encodeURIComponent(vmid));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('#st').textContent = 'connected'; resize(); term.focus(); ws.send('0\r'); };
+  ws.onmessage = e => term.write(new Uint8Array(e.data));
+  ws.onclose = () => { $('#st').textContent = 'disconnected - ⟳ to reconnect'; };
+}
+term.onData(d => { if (ws && ws.readyState === 1) ws.send('0' + d); });
+window.addEventListener('resize', resize);
+$('#re').onclick = connect;
+$('#fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 connect();
 """
 
