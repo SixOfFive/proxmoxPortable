@@ -2,6 +2,13 @@
 
 All notable changes to proxmox-portable. Newest first.
 
+## Unreleased
+
+### Changed
+- README: a "The browser" requirement (WebSockets and JS modules; a reverse proxy must pass
+  WebSocket upgrades for `/vncws` and `/termws`). "Updating" now says that installs from 1.0.x must
+  run `fetch-console` once for the consoles, and that the new config keys have defaults.
+
 ## 1.2.0 - 2026-11-08 - released as tag `v1.2.0`
 
 ### Added

@@ -169,6 +169,13 @@ From a node, `fetch-qemu` copies Proxmox's own packages, so the versions match y
 `libtpms0`, `libproxmox-backup-qemu0`, `librados2`, `librbd1`. It unpacks them; it does not install
 them as packages.
 
+### The browser
+
+Any current Chrome, Edge, Firefox or Safari. The consoles need WebSockets and JavaScript modules,
+which every browser from the last several years has. If you put a reverse proxy in front of
+port 8006, it must pass WebSocket upgrades for `/vncws` and `/termws`. Otherwise the consoles
+won't connect, while the rest of the UI still works.
+
 ### The Proxmox cluster
 
 - **Proxmox VE 9.x** (tested on 9.2). 8.x is likely to work but is untested.
@@ -716,6 +723,21 @@ cd proxmoxPortable && git pull
 sudo install -m 0755 proxmox-portable.py /usr/local/sbin/proxmox-portable
 sudo systemctl restart proxmox-portable          # running guests and jobs keep running
 ```
+
+**Upgrading from 1.0.x:** the web consoles (added in 1.1.0 and 1.2.0) need files that `setup`
+only fetches on new installs. Run this once after updating, then check that `check` shows noVNC and
+xterm.js as `ok`:
+
+```bash
+sudo proxmox-portable fetch-console
+sudo proxmox-portable check
+```
+
+The Console buttons stay greyed out until then. Running `setup` again also works, and is safe to
+repeat.
+
+**New config keys** (`novnc_dir`, `xterm_dir` in `[paths]`) have defaults. Existing config files
+don't need editing.
 
 **After every Proxmox upgrade that brings a new `pve-qemu-kvm`, run
 `sudo proxmox-portable fetch-qemu` again.** Live moves to this host need its QEMU to be at least
