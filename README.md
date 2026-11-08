@@ -626,3 +626,10 @@ sed -i '/ proxmox-portable@<host>$/d' /etc/pve/priv/authorized_keys
 pveum user token remove root@pam portable
 rm -rf /var/tmp/proxmox-portable                          # on each node that received syncs
 ```
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE). Use at your own risk: this tool moves live guests and writes into
+their disks, so test it on throwaway guests first.

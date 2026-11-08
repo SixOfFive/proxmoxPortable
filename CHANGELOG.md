@@ -2,6 +2,11 @@
 
 All notable changes to proxmox-portable. Newest first.
 
+## Unreleased
+
+### Added
+- MIT license (`LICENSE`), linked from the README.
+
 ## 1.0.0 - 2026-11-08
 
 First public release. proxmox-portable is a single-script rewrite of an earlier private,
