@@ -124,6 +124,18 @@ LAN while guests run on it.
 
 ## Requirements
 
+### Requirement changes by version
+
+When a release changes what you need, it is listed here. **If you update, apply every row newer
+than the version you run.**
+
+| Version | Change | What to do when updating |
+|---|---|---|
+| 1.2.1 | none (documentation only) | nothing |
+| 1.2.0 | the container console needs xterm.js (Debian `node-xterm`, unpacked, not installed); new optional config key `xterm_dir` | `sudo proxmox-portable fetch-console` |
+| 1.1.0 | the VM console needs noVNC (Debian `novnc`, unpacked, not installed). `fetch-console` needs working apt sources. The browser needs WebSockets, and a reverse proxy must pass them. qcow2 support uses `qemu-nbd` on the nodes (already part of `pve-qemu-kvm`). New optional config key `novnc_dir` | `sudo proxmox-portable fetch-console` |
+| 1.0.0 | first release: everything under this section | follow [Install](#install) |
+
 ### The portable host
 
 | | Needed |
@@ -724,6 +736,9 @@ sudo install -m 0755 proxmox-portable.py /usr/local/sbin/proxmox-portable
 sudo systemctl restart proxmox-portable          # running guests and jobs keep running
 ```
 
+**Check [Requirement changes by version](#requirement-changes-by-version) first** and do what
+it lists for every version newer than yours.
+
 **Upgrading from 1.0.x:** the web consoles (added in 1.1.0 and 1.2.0) need files that `setup`
 only fetches on new installs. Run this once after updating, then check that `check` shows noVNC and
 xterm.js as `ok`:
@@ -785,10 +800,12 @@ rm -rf /var/tmp/proxmox-portable                          # on each node that re
 ## Releases
 
 Each release is a git tag. A tag's page has the source as `.zip` / `.tar.gz`. `main` may hold
-newer, not yet released work.
+newer, not yet released work. Before updating, read
+[Requirement changes by version](#requirement-changes-by-version).
 
 | Version | Date | What | Get it |
 |---|---|---|---|
+| **v1.2.1** | 2026-11-08 | Documentation release: the browser requirement, the upgrade step for the console files (`fetch-console`) and the new [Requirement changes by version](#requirement-changes-by-version) table. No code changes besides the version number | [tag v1.2.1](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.2.1) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.2.1/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.2.1.tar.gz) |
 | **v1.2.0** | 2026-11-08 | Container console (xterm.js from Debian, PTY bridge built in, follows the container's console mode); disk copies skip empty space and use a parallel chunked checksum: cold copies and pre-seeds about 3.4x faster, the cold-return check about 4x faster | [tag v1.2.0](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.2.0) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.2.0/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.2.0.tar.gz) |
 | **v1.1.0** | 2026-11-08 | VNC console for VMs on the portable host (noVNC unpacked from Debian, WebSocket bridge built in); qcow2 source volumes; return to a different node; target-storage check; faster qcow2 reads | [tag v1.1.0](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.1.0) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.1.0/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.1.0.tar.gz) |
 | **v1.0.0** | 2026-11-08 | First public release. Live/cold VM moves, container moves, sync, return; tested as described in [What has been tested](#what-has-been-tested) | [tag v1.0.0](https://github.com/SixOfFive/proxmoxPortable/releases/tag/v1.0.0) · [script only](https://raw.githubusercontent.com/SixOfFive/proxmoxPortable/v1.0.0/proxmox-portable.py) · [.tar.gz](https://github.com/SixOfFive/proxmoxPortable/archive/refs/tags/v1.0.0.tar.gz) |

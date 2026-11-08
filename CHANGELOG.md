@@ -2,7 +2,14 @@
 
 All notable changes to proxmox-portable. Newest first.
 
-## Unreleased
+## 1.2.1 - 2026-11-08 - released as tag `v1.2.1`
+
+Documentation release. Users need to know what changes when requirements change; 1.2.0's tagged
+README did not say how to update an existing install.
+
+### Added
+- README "Requirement changes by version": a table of what each release changed in requirements
+  and what to do when updating. Releases, Updating and Requirements point to it.
 
 ### Changed
 - README: a "The browser" requirement (WebSockets and JS modules; a reverse proxy must pass

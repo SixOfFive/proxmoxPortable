@@ -52,7 +52,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_CONF = "/etc/proxmox-portable/proxmox-portable.conf"
 SELF = os.path.realpath(__file__)
 QRUN = "/var/run/qemu-server"          # Proxmox's command lines expect their sockets here
